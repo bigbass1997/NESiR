@@ -1,13 +1,9 @@
-use std::cell::RefCell;
-use std::rc::Rc;
 use std::time::Instant;
 use argh::FromArgs;
 use crate::arch::mappers::RomFile;
 use crate::arch::{CpuBusAccessible, Nes};
-use crate::util::InfCell;
 
 pub mod arch;
-pub mod util;
 
 #[derive(FromArgs)]
 /// Reach new heights
@@ -20,19 +16,14 @@ struct Args {
 fn main() {
     let args: Args = argh::from_env();
     
-    let nes_cell = InfCell::new(Nes::default());
-    let nes = nes_cell.get_mut();
-    let nes_ref = nes_cell.get_mut();
-    
-    nes.cart.mapper = RomFile::new(std::fs::read(args.rom).unwrap()).into_mapper();
-    nes.cpu.init_pc(nes_ref);
+    let mut nes = Nes::new();
+    nes.load_rom(RomFile::new(std::fs::read(args.rom).unwrap()));
     
     loop {
         let start = Instant::now();
         
         for _ in 0..21477272 {
-            nes.cpu.tick(&nes_cell);
-            nes.ppu.tick(&nes_cell);
+            nes.tick();
         }
         
         let elapsed = start.elapsed();
@@ -54,31 +45,26 @@ pub struct TestState {
     pub cyc: usize,
 }
 impl TestState {
-    pub fn from_cpu(nes_cell: &InfCell<Nes>) -> Self {
-        let nes = nes_cell.get_mut();
-        let nes_ref = nes_cell.get_mut();
-        let cpu = &nes.cpu;
-        
+    pub fn from_nes(mut nes: Nes) -> Self {
         Self {
-            pc: cpu.pc - 1,
-            opcode: nes_ref.read(cpu.pc - 1),
-            sp: cpu.sp.0,
-            status: cpu.status.bits(),
-            acc: cpu.acc,
-            x: cpu.x,
-            y: cpu.y,
-            cyc: cpu.cyc,
+            pc: nes.cpu.pc - 1,
+            opcode: nes.read(nes.cpu.pc - 1),
+            sp: nes.cpu.sp.0,
+            status: nes.cpu.status.bits(),
+            acc: nes.cpu.acc,
+            x: nes.cpu.x,
+            y: nes.cpu.y,
+            cyc: nes.cpu.cyc,
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::arch::Nes;
-    use crate::arch::cpu::StatusReg;
+    use crate::arch::cpu::{Cpu, StatusReg};
     use crate::arch::mappers::RomFile;
+    use crate::arch::Nes;
     use crate::TestState;
-    use crate::util::InfCell;
 
     #[derive(Debug, Eq, PartialEq)]
     pub enum TestError {
@@ -154,19 +140,18 @@ mod tests {
         let log: Vec<TestState> = log.lines().map(|line| TestState::new(line)).collect();
         let mut log_iter = log.iter();
         
-        let nes_cell = InfCell::new(Nes::default());
-        let nes = nes_cell.get_mut();
+        let mut nes = Nes::new();
         
         nes.cart.mapper = rom.into_mapper();
         nes.cpu.pc = 0xC000;
-        nes.cpu.prefetch = Some(nes.cpu.fetch(nes_cell.get_mut()));
+        nes.cpu.prefetch = Some(Cpu::fetch(&mut nes));
         nes.cpu.cyc = 7;
         nes.ppu.pos = crate::arch::ppu::PixelPos { cycle: 19, scanline: 0 };
         nes.cpu.status = StatusReg::from_bits_truncate(0x24);
         
         loop {
-            nes.cpu.tick(&nes_cell);
-            nes.ppu.tick(&nes_cell);
+            Cpu::tick(&mut nes);
+            //nes.ppu.tick(&mut nes);
             
             if let Some(state) = nes.cpu.last_state {
                 if let Some(log) = log_iter.next() {

@@ -1,6 +1,5 @@
 use std::fmt::{Display, Formatter};
 use crate::arch::{Nes, CpuBusAccessible, ClockDivider};
-use crate::util::InfCell;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct PixelPos {
@@ -55,25 +54,25 @@ impl Default for Ppu {
     }}
 }
 impl Ppu {
-    pub fn tick(&mut self, nes_cell: &InfCell<Nes>) {
-        if self.clock_divider.tick() {
-            self.cycle(nes_cell);
+    pub fn tick(nes: &mut Nes) {
+        if nes.ppu.clock_divider.tick() {
+            Ppu::cycle(nes);
         }
     }
     
-    pub fn cycle(&mut self, nes_cell: &InfCell<Nes>) {
-        let _bus = nes_cell.get_mut();
+    pub fn cycle(nes: &mut Nes) {
+        let Nes { ppu, ..} = nes;
         
-        match self.pos.cycle {
-            1 if self.pos.scanline == 241 => self.vblank = true,
-            1 if self.pos.scanline == 261 => {
-                self.vblank = false;
+        match ppu.pos.cycle {
+            1 if ppu.pos.scanline == 241 => ppu.vblank = true,
+            1 if ppu.pos.scanline == 261 => {
+                ppu.vblank = false;
                 //TODO: clear sprite overflow and sprite 0 hit bits
             },
             _ => ()
         }
         
-        self.pos.inc();
+        ppu.pos.inc();
     }
     
     fn port_read(&mut self, addr: u16) -> u8 {
@@ -90,7 +89,7 @@ impl Ppu {
             _ => unreachable!()
         }
         
-        self.ports_latch
+        self.ports_latch //TODO: add latch decay over time
     }
     
     fn port_write(&mut self, addr: u16, data: u8) {

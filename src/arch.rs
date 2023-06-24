@@ -1,5 +1,6 @@
 use crate::arch::cartridge::Cartridge;
 use crate::arch::cpu::Cpu;
+use crate::arch::mappers::RomFile;
 use crate::arch::ppu::Ppu;
 
 pub mod cartridge;
@@ -25,11 +26,26 @@ pub trait CpuBusAccessible {
 /// The [`Nes`] and all components in it, implement the [`CpuBusAccessible`] trait. Methods exposed
 /// by this trait, are accessed with respect to the CPU's memory map. The PPU's own memory map is
 /// NOT directly accessible through implementations of this trait.
-#[derive(Clone, Default, Debug)]
+#[derive(Debug, Default, Clone)]
 pub struct Nes {
     pub cpu: Cpu,
     pub ppu: Ppu,
     pub cart: Cartridge,
+}
+impl Nes {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    
+    pub fn tick(&mut self) {
+        Cpu::tick(self);
+        Ppu::tick(self);
+    }
+    
+    pub fn load_rom(&mut self, rom: RomFile) {
+        self.cart.mapper = rom.into_mapper();
+        Cpu::init_pc(self);
+    }
 }
 impl CpuBusAccessible for Nes {
     fn write(&mut self, addr: u16, data: u8) {
