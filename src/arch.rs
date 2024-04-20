@@ -1,3 +1,4 @@
+use log::trace;
 use crate::arch::cartridge::Cartridge;
 use crate::arch::cpu::Cpu;
 use crate::arch::mappers::RomFile;
@@ -37,6 +38,7 @@ impl Nes {
         Self::default()
     }
     
+    #[inline(always)]
     pub fn tick(&mut self) {
         Cpu::tick(self);
         Ppu::tick(self);
@@ -49,13 +51,15 @@ impl Nes {
 }
 impl CpuBusAccessible for Nes {
     fn write(&mut self, addr: u16, data: u8) {
+        self.cpu.predecode = data;
+        
         if addr == 0x0647 {
-            println!("### Wrote {:#04X} to {:#06X}", data, addr);
+            //trace!("### Wrote {:#04X} to {:#06X}", data, addr);
         } else {
-            println!("    Wrote {:#04X} to {:#06X}", data, addr);
+            //trace!("    Wrote {:#04X} to {:#06X}", data, addr);
         }
         match addr {
-            0x0000..=0x1FFF => self.cpu.write(addr, data),
+            0x0000..=0x1FFF | 0x4014 => self.cpu.write(addr, data),
             0x2000..=0x3FFF => self.ppu.write(addr, data),
             0x4000..=0x4017 => (),
             0x4018..=0x401F => panic!("Write attempt to CPU Test Mode at address {:#06X} ({:#04X})", addr, data),
@@ -75,10 +79,13 @@ impl CpuBusAccessible for Nes {
         };
         
         if addr == 0x0647 {
-            println!("### Read {:#04X} from {:#06X}", val, addr);
+            //trace!("### Read {:#04X} from {:#06X}", val, addr);
         } else {
-            //println!("    Read {:#04X} from {:#06X}", val, addr);
+            //trace!("    Read {:#04X} from {:#06X}", val, addr);
         }
+        
+        self.cpu.predecode = val;
+        
         val
     }
 }

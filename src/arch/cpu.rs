@@ -5,6 +5,7 @@ use std::fmt::{Debug, Formatter};
 use std::num::Wrapping;
 use crate::arch::{Nes, CpuBusAccessible, ClockDivider};
 use bitflags::bitflags;
+use log::trace;
 use AddrMode::*;
 use crate::TestState;
 
@@ -119,9 +120,12 @@ pub struct Cpu {
     pub acc: u8,
     pub x: u8,
     pub y: u8,
+    /// active-low
     pub rdy: bool,
-    pub(crate) prefetch: Option<u8>,
-    fetch_needed: bool,
+    /// active-low
+    pub nmi: bool,
+    /// Predecode Register (PD)
+    pub(crate) predecode: u8,
     proc: InstructionProcedure,
     pub clock_divider: ClockDivider<12>,
     pub cyc: usize,
@@ -141,8 +145,8 @@ impl Default for Cpu {
             x: 0,
             y: 0,
             rdy: true,
-            prefetch: None,
-            fetch_needed: false, // used for debugging
+            nmi: true,
+            predecode: 0,
             proc,
             clock_divider: ClockDivider::new(0), //todo: randomize
             cyc: 0,
@@ -155,9 +159,10 @@ fn default_procedure(_: &mut Nes) {}
 impl Cpu {
     pub fn init_pc(nes: &mut Nes) {
         nes.cpu.pc = ((nes.cart.read_cpu(0xFFFD) as u16) << 8) | (nes.cart.read_cpu(0xFFFC) as u16);
-        nes.cpu.prefetch = Some(Cpu::fetch(nes));
+        nes.read(nes.cpu.pc); // loads predecode register
     }
     
+    #[inline(always)]
     pub fn tick(nes: &mut Nes) {
         if nes.cpu.clock_divider.tick() {
             Cpu::cycle(nes);
@@ -170,15 +175,9 @@ impl Cpu {
         }
         
         if nes.cpu.proc.done {
-            if nes.cpu.prefetch.is_none() { // if next instruction wasn't prefetched at end of previous, we must fetch now (this is considered the first cycle of proc)
-                panic!("prefetch should always occur");
-            }
+            Cpu::fetch(nes);
             
-            let opcode = nes.cpu.prefetch.unwrap();
-            nes.cpu.prefetch = None;
-            
-            nes.cpu.proc = match opcode {
-                
+            nes.cpu.proc = match nes.cpu.predecode {
                 0x00 => InstructionProcedure::new(brk, Auto),
                 0x01 => InstructionProcedure::new(ora, IndirectX),
                 0x03 => InstructionProcedure::new(slo, IndirectX),
@@ -439,23 +438,21 @@ impl Cpu {
                 0xFE => InstructionProcedure::new(inc, AbsoluteX),
                 0xFF => InstructionProcedure::new(isb, AbsoluteX),
                 
-                _ => panic!("Attempt to run invalid/unimplemented opcode! PC: {:#06X}, Op: {:#06X}", nes.cpu.pc, opcode)
-            }; // decode opcode into an instruction proc (this doesn't consume cycles)
+                _ => panic!("Attempt to run invalid/unimplemented opcode! PC: {:#06X}, Op: {:#06X}", nes.cpu.pc, nes.cpu.predecode)
+            };
             
-            // debugging
-            if !nes.cpu.fetch_needed {
-                nes.cpu.last_state = Some(TestState::from_nes(nes.clone()));
-                //println!("         {:04X} {:02X}        Status: {}, ACC: {:02X}, X: {:02X}, Y: {:02X}, SP: {:02X}, CYC:{}", self.pc - 1, opcode, self.status, self.acc, self.x, self.y, self.sp, self.cyc);
-                println!("         PC: {:04X}, Op: {:02X}, Status: {}, ACC: {:02X}, X: {:02X}, Y: {:02X}, SP: {:02X}, PPU: {}, CYC: {}", nes.cpu.pc - 1, opcode, nes.cpu.status, nes.cpu.acc, nes.cpu.x, nes.cpu.y, nes.cpu.sp, nes.ppu.pos, nes.cpu.cyc);
-            }
-            nes.cpu.fetch_needed = false;
+            nes.cpu.last_state = Some(TestState::from_nes(nes.clone()));
+            trace!("         PC: {:04X}, Op: {:02X}, Status: {}, ACC: {:02X}, X: {:02X}, Y: {:02X}, SP: {:02X}, PPU: {}, CYC: {}", nes.cpu.pc - 1, nes.cpu.predecode, nes.cpu.status, nes.cpu.acc, nes.cpu.x, nes.cpu.y, nes.cpu.sp, nes.ppu.pos, nes.cpu.cyc);
+            
+            nes.cpu.proc.cycle = 2; // the decode above costs 1 cycle
+        } else {
+            InstructionProcedure::step(nes);
         }
         
-        InstructionProcedure::step(nes);
         nes.cpu.cyc += 1;
     }
     
-    pub(crate) fn fetch(nes: &mut Nes) -> u8 {
+    fn fetch(nes: &mut Nes) -> u8 {
         let fetch = nes.read(nes.cpu.pc);
         nes.cpu.pc += 1;
         
@@ -502,8 +499,6 @@ fn adc(nes: &mut Nes) {
         nes.cpu.status.set(StatusReg::Negative, result & 0x80 > 0);
         nes.cpu.acc = result as u8;
         
-        nes.cpu.prefetch = Some(Cpu::fetch(nes));
-        
         nes.cpu.proc.done = true;
     }
 }
@@ -514,7 +509,6 @@ fn and(nes: &mut Nes) {
         
         nes.cpu.status.set(StatusReg::Zero, nes.cpu.acc == 0);
         nes.cpu.status.set(StatusReg::Negative, nes.cpu.acc & 0x80 > 0);
-        nes.cpu.prefetch = Some(Cpu::fetch(nes));
         
         nes.cpu.proc.done = true;
     }
@@ -531,7 +525,8 @@ fn asl(nes: &mut Nes) {
                     
                     nes.cpu.status.set(StatusReg::Zero, nes.cpu.acc == 0);
                     nes.cpu.status.set(StatusReg::Negative, nes.cpu.acc & 0x80 > 0);
-                    nes.cpu.prefetch = Some(Cpu::fetch(nes));
+                    
+                    nes.read(nes.cpu.pc);
                     nes.cpu.proc.done = true;
                 },
                 _ => ()
@@ -545,7 +540,6 @@ fn asl(nes: &mut Nes) {
                 nes.cpu.status.set(StatusReg::Zero, nes.cpu.proc.tmp0 == 0);
                 nes.cpu.status.set(StatusReg::Negative, nes.cpu.proc.tmp0 & 0x80 > 0);
                 nes.write(addr, nes.cpu.proc.tmp0);
-                nes.cpu.prefetch = Some(Cpu::fetch(nes));
                 
                 nes.cpu.proc.done = true;
             }
@@ -569,7 +563,6 @@ fn bit(nes: &mut Nes) {
         nes.cpu.status.set(StatusReg::Zero, tmp & nes.cpu.acc == 0);
         nes.cpu.status.set(StatusReg::Overflow, tmp & 0x40 > 0);
         nes.cpu.status.set(StatusReg::Negative, tmp & 0x80 > 0);
-        nes.cpu.prefetch = Some(Cpu::fetch(nes));
         
         nes.cpu.proc.done = true;
     }
@@ -594,7 +587,6 @@ fn brk(nes: &mut Nes) {
             nes.cpu.proc.tmp1 = nes.read(0xFFFF);
             
             nes.cpu.pc = ((nes.cpu.proc.tmp1 as u16) << 8) | (nes.cpu.proc.tmp0 as u16);
-            nes.cpu.prefetch = Some(Cpu::fetch(nes));
             
             nes.cpu.proc.done = true;
         }
@@ -614,7 +606,6 @@ fn branch(nes: &mut Nes, to_branch: bool) {
         2 => {
             nes.cpu.proc.tmp0 = Cpu::fetch(nes);
             if !to_branch { // if to_branch is false, do not branch
-                nes.cpu.prefetch = Some(Cpu::fetch(nes));
                 nes.cpu.proc.done = true;
             }
         },
@@ -622,13 +613,15 @@ fn branch(nes: &mut Nes, to_branch: bool) {
             nes.cpu.proc.tmp_addr = (nes.cpu.pc as i16 + nes.cpu.proc.tmp0 as i8 as i16) as u16;
             if (nes.cpu.pc & 0xFF00) == (nes.cpu.proc.tmp_addr & 0xFF00) { // branch to same page
                 nes.cpu.pc = nes.cpu.proc.tmp_addr;
-                nes.cpu.prefetch = Some(Cpu::fetch(nes));
+                
+                nes.read(nes.cpu.pc);
                 nes.cpu.proc.done = true;
             }
         },
         4 => {
             nes.cpu.pc = nes.cpu.proc.tmp_addr;
-            nes.cpu.prefetch = Some(Cpu::fetch(nes));
+            
+            nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
         },
         _ => ()
@@ -639,7 +632,8 @@ fn clc(nes: &mut Nes) {
     match nes.cpu.proc.cycle {
         2 => {
             nes.cpu.status.set(StatusReg::Carry, false);
-            nes.cpu.prefetch = Some(Cpu::fetch(nes));
+            
+            nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
         },
         _ => ()
@@ -649,7 +643,8 @@ fn cld(nes: &mut Nes) {
     match nes.cpu.proc.cycle {
         2 => {
             nes.cpu.status.set(StatusReg::Decimal, false);
-            nes.cpu.prefetch = Some(Cpu::fetch(nes));
+            
+            nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
         },
         _ => ()
@@ -659,7 +654,8 @@ fn cli(nes: &mut Nes) {
     match nes.cpu.proc.cycle {
         2 => {
             nes.cpu.status.set(StatusReg::InterruptDisable, false);
-            nes.cpu.prefetch = Some(Cpu::fetch(nes));
+            
+            nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
         },
         _ => ()
@@ -669,7 +665,8 @@ fn clv(nes: &mut Nes) {
     match nes.cpu.proc.cycle {
         2 => {
             nes.cpu.status.set(StatusReg::Overflow, false);
-            nes.cpu.prefetch = Some(Cpu::fetch(nes));
+            
+            nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
         },
         _ => ()
@@ -682,7 +679,6 @@ fn cmp(nes: &mut Nes) {
         nes.cpu.status.set(StatusReg::Carry, nes.cpu.acc >= data);
         nes.cpu.status.set(StatusReg::Zero, nes.cpu.acc == data);
         nes.cpu.status.set(StatusReg::Negative, nes.cpu.acc.wrapping_sub(data) & 0x80 > 0);
-        nes.cpu.prefetch = Some(Cpu::fetch(nes));
         
         nes.cpu.proc.done = true;
     }
@@ -694,7 +690,6 @@ fn cpx(nes: &mut Nes) {
         nes.cpu.status.set(StatusReg::Carry, nes.cpu.x >= data);
         nes.cpu.status.set(StatusReg::Zero, nes.cpu.x == data);
         nes.cpu.status.set(StatusReg::Negative, nes.cpu.x.wrapping_sub(data) & 0x80 > 0);
-        nes.cpu.prefetch = Some(Cpu::fetch(nes));
         
         nes.cpu.proc.done = true;
     }
@@ -706,7 +701,6 @@ fn cpy(nes: &mut Nes) {
         nes.cpu.status.set(StatusReg::Carry, nes.cpu.y >= data);
         nes.cpu.status.set(StatusReg::Zero, nes.cpu.y == data);
         nes.cpu.status.set(StatusReg::Negative, nes.cpu.y.wrapping_sub(data) & 0x80 > 0);
-        nes.cpu.prefetch = Some(Cpu::fetch(nes));
         
         nes.cpu.proc.done = true;
     }
@@ -719,7 +713,6 @@ fn dcp(nes: &mut Nes) {
         nes.cpu.status.set(StatusReg::Zero, nes.cpu.acc == nes.cpu.proc.tmp0);
         nes.cpu.status.set(StatusReg::Negative, nes.cpu.acc.wrapping_sub(nes.cpu.proc.tmp0) & 0x80 > 0);
         nes.write(addr, nes.cpu.proc.tmp0);
-        nes.cpu.prefetch = Some(Cpu::fetch(nes));
         
         nes.cpu.proc.done = true;
     }
@@ -731,7 +724,6 @@ fn dec(nes: &mut Nes) {
         nes.cpu.status.set(StatusReg::Zero, nes.cpu.proc.tmp0 == 0);
         nes.cpu.status.set(StatusReg::Negative, nes.cpu.proc.tmp0 & 0x80 > 0);
         nes.write(addr, nes.cpu.proc.tmp0);
-        nes.cpu.prefetch = Some(Cpu::fetch(nes));
         
         nes.cpu.proc.done = true;
     }
@@ -742,7 +734,8 @@ fn dex(nes: &mut Nes) {
             nes.cpu.x = nes.cpu.x.wrapping_sub(1);
             nes.cpu.status.set(StatusReg::Zero, nes.cpu.x == 0);
             nes.cpu.status.set(StatusReg::Negative, nes.cpu.x & 0x80 > 0);
-            nes.cpu.prefetch = Some(Cpu::fetch(nes));
+            
+            nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
         },
         _ => ()
@@ -754,7 +747,8 @@ fn dey(nes: &mut Nes) {
             nes.cpu.y = nes.cpu.y.wrapping_sub(1);
             nes.cpu.status.set(StatusReg::Zero, nes.cpu.y == 0);
             nes.cpu.status.set(StatusReg::Negative, nes.cpu.y & 0x80 > 0);
-            nes.cpu.prefetch = Some(Cpu::fetch(nes));
+            
+            nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
         },
         _ => ()
@@ -766,7 +760,6 @@ fn eor(nes: &mut Nes) {
         
         nes.cpu.status.set(StatusReg::Zero, nes.cpu.acc == 0);
         nes.cpu.status.set(StatusReg::Negative, nes.cpu.acc & 0x80 > 0);
-        nes.cpu.prefetch = Some(Cpu::fetch(nes));
         
         nes.cpu.proc.done = true;
     }
@@ -778,7 +771,6 @@ fn inc(nes: &mut Nes) {
         nes.cpu.status.set(StatusReg::Zero, nes.cpu.proc.tmp0 == 0);
         nes.cpu.status.set(StatusReg::Negative, nes.cpu.proc.tmp0 & 0x80 > 0);
         nes.write(addr, nes.cpu.proc.tmp0);
-        nes.cpu.prefetch = Some(Cpu::fetch(nes));
         
         nes.cpu.proc.done = true;
     }
@@ -789,7 +781,8 @@ fn inx(nes: &mut Nes) {
             nes.cpu.x = nes.cpu.x.wrapping_add(1);
             nes.cpu.status.set(StatusReg::Zero, nes.cpu.x == 0);
             nes.cpu.status.set(StatusReg::Negative, nes.cpu.x & 0x80 > 0);
-            nes.cpu.prefetch = Some(Cpu::fetch(nes));
+            
+            nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
         },
         _ => ()
@@ -801,7 +794,8 @@ fn iny(nes: &mut Nes) {
             nes.cpu.y = nes.cpu.y.wrapping_add(1);
             nes.cpu.status.set(StatusReg::Zero, nes.cpu.y == 0);
             nes.cpu.status.set(StatusReg::Negative, nes.cpu.y & 0x80 > 0);
-            nes.cpu.prefetch = Some(Cpu::fetch(nes));
+            
+            nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
         },
         _ => ()
@@ -822,7 +816,6 @@ fn isb(nes: &mut Nes) {
         nes.cpu.acc = result as u8;
         
         nes.write(addr, nes.cpu.proc.tmp0);
-        nes.cpu.prefetch = Some(Cpu::fetch(nes));
         
         nes.cpu.proc.done = true;
     }
@@ -835,7 +828,7 @@ fn jmp(nes: &mut Nes) {
                 3 => {
                     let pch = nes.read(nes.cpu.pc) as u16;
                     nes.cpu.pc = (pch << 8) | (nes.cpu.proc.tmp0 as u16);
-                    nes.cpu.prefetch = Some(Cpu::fetch(nes));
+                    
                     nes.cpu.proc.done = true;
                 },
                 _ => ()
@@ -853,7 +846,7 @@ fn jmp(nes: &mut Nes) {
                     nes.cpu.proc.tmp1 = nes.read(((nes.cpu.proc.tmp_addr + 1) & 0x00FF) + (nes.cpu.proc.tmp_addr & 0xFF00));
                     
                     nes.cpu.pc = ((nes.cpu.proc.tmp1 as u16) << 8) | (nes.cpu.proc.tmp0 as u16);
-                    nes.cpu.prefetch = Some(Cpu::fetch(nes));
+                    
                     nes.cpu.proc.done = true;
                 }
                 _ => ()
@@ -872,7 +865,7 @@ fn jsr(nes: &mut Nes) {
             nes.cpu.proc.tmp1 = Cpu::fetch(nes);
             
             nes.cpu.pc = ((nes.cpu.proc.tmp1 as u16) << 8) | (nes.cpu.proc.tmp0 as u16);
-            nes.cpu.prefetch = Some(Cpu::fetch(nes));
+            
             nes.cpu.proc.done = true;
         },
         _ => ()
@@ -887,19 +880,18 @@ fn las(nes: &mut Nes) {
         
         nes.cpu.status.set(StatusReg::Zero, tmp == 0);
         nes.cpu.status.set(StatusReg::Negative, tmp & 0x80 > 0);
-        nes.cpu.prefetch = Some(Cpu::fetch(nes));
         
         nes.cpu.proc.done = true;
     }
 }
 fn lax(nes: &mut Nes) {
     if let Some(addr) = effective_addr(nes) {
-        nes.cpu.acc = nes.read(addr);
-        nes.cpu.x = nes.read(addr);
+        let tmp = nes.read(addr);
+        nes.cpu.acc = tmp;
+        nes.cpu.x = tmp;
         
         nes.cpu.status.set(StatusReg::Zero, nes.cpu.x == 0);
         nes.cpu.status.set(StatusReg::Negative, nes.cpu.x & 0x80 > 0);
-        nes.cpu.prefetch = Some(Cpu::fetch(nes));
         
         nes.cpu.proc.done = true;
     }
@@ -910,7 +902,6 @@ fn lda(nes: &mut Nes) {
         
         nes.cpu.status.set(StatusReg::Zero, nes.cpu.acc == 0);
         nes.cpu.status.set(StatusReg::Negative, nes.cpu.acc & 0x80 > 0);
-        nes.cpu.prefetch = Some(Cpu::fetch(nes));
         
         nes.cpu.proc.done = true;
     }
@@ -921,7 +912,6 @@ fn ldx(nes: &mut Nes) {
         
         nes.cpu.status.set(StatusReg::Zero, nes.cpu.x == 0);
         nes.cpu.status.set(StatusReg::Negative, nes.cpu.x & 0x80 > 0);
-        nes.cpu.prefetch = Some(Cpu::fetch(nes));
         
         nes.cpu.proc.done = true;
     }
@@ -932,7 +922,6 @@ fn ldy(nes: &mut Nes) {
         
         nes.cpu.status.set(StatusReg::Zero, nes.cpu.y == 0);
         nes.cpu.status.set(StatusReg::Negative, nes.cpu.y & 0x80 > 0);
-        nes.cpu.prefetch = Some(Cpu::fetch(nes));
         
         nes.cpu.proc.done = true;
     }
@@ -947,7 +936,8 @@ fn lsr(nes: &mut Nes) {
                     
                     nes.cpu.status.set(StatusReg::Zero, nes.cpu.acc == 0);
                     nes.cpu.status.set(StatusReg::Negative, nes.cpu.acc & 0x80 > 0);
-                    nes.cpu.prefetch = Some(Cpu::fetch(nes));
+                    
+                    nes.read(nes.cpu.pc);
                     nes.cpu.proc.done = true;
                 },
                 _ => ()
@@ -961,7 +951,6 @@ fn lsr(nes: &mut Nes) {
                 nes.cpu.status.set(StatusReg::Zero, nes.cpu.proc.tmp0 == 0);
                 nes.cpu.status.set(StatusReg::Negative, nes.cpu.proc.tmp0 & 0x80 > 0);
                 nes.write(addr, nes.cpu.proc.tmp0);
-                nes.cpu.prefetch = Some(Cpu::fetch(nes));
                 
                 nes.cpu.proc.done = true;
             }
@@ -972,11 +961,12 @@ fn lxa(nes: &mut Nes) { unimplemented!() }
 fn nop(nes: &mut Nes) {
     if nes.cpu.proc.mode == Implied {
         if nes.cpu.proc.cycle == 2 {
-            nes.cpu.prefetch = Some(Cpu::fetch(nes));
+            
+            nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
         }
     } else if let Some(_) = effective_addr(nes) {
-        nes.cpu.prefetch = Some(Cpu::fetch(nes));
+        nes.read(nes.cpu.pc);
         nes.cpu.proc.done = true;
     }
 }
@@ -986,7 +976,6 @@ fn ora(nes: &mut Nes) {
         
         nes.cpu.status.set(StatusReg::Zero, nes.cpu.acc == 0);
         nes.cpu.status.set(StatusReg::Negative, nes.cpu.acc & 0x80 > 0);
-        nes.cpu.prefetch = Some(Cpu::fetch(nes));
         
         nes.cpu.proc.done = true;
     }
@@ -996,7 +985,6 @@ fn pha(nes: &mut Nes) {
         2 => { nes.read(nes.cpu.pc); },
         3 => {
             Cpu::stack_push(nes, nes.cpu.acc);
-            nes.cpu.prefetch = Some(Cpu::fetch(nes));
             
             nes.cpu.proc.done = true;
         },
@@ -1008,7 +996,6 @@ fn php(nes: &mut Nes) {
         2 => { nes.read(nes.cpu.pc); },
         3 => {
             Cpu::stack_push(nes, nes.cpu.status.bits | 0b00110000); //TODO: Verify bits [5:4] are supposed to be set by PHP
-            nes.cpu.prefetch = Some(Cpu::fetch(nes));
             
             nes.cpu.proc.done = true;
         },
@@ -1024,7 +1011,6 @@ fn pla(nes: &mut Nes) {
             
             nes.cpu.status.set(StatusReg::Zero, nes.cpu.acc == 0);
             nes.cpu.status.set(StatusReg::Negative, nes.cpu.acc & 0x80 > 0);
-            nes.cpu.prefetch = Some(Cpu::fetch(nes));
             
             nes.cpu.proc.done = true;
         },
@@ -1038,8 +1024,6 @@ fn plp(nes: &mut Nes) {
         4 => {
             nes.cpu.status.bits = Cpu::stack_pull(nes) & 0b11001111; //TODO: Verify bits [5:4] are supposed to be ignored by PLP
             nes.cpu.status.bits |= 0b00100000; // Apparently, bit 5 should always be set
-            
-            nes.cpu.prefetch = Some(Cpu::fetch(nes));
             
             nes.cpu.proc.done = true;
         },
@@ -1057,7 +1041,6 @@ fn rla(nes: &mut Nes) {
         nes.cpu.status.set(StatusReg::Zero, nes.cpu.acc == 0);
         nes.cpu.status.set(StatusReg::Negative, nes.cpu.acc & 0x80 > 0);
         nes.write(addr, nes.cpu.proc.tmp0);
-        nes.cpu.prefetch = Some(Cpu::fetch(nes));
         
         nes.cpu.proc.done = true;
     }
@@ -1077,7 +1060,6 @@ fn rra(nes: &mut Nes) {
         nes.cpu.status.set(StatusReg::Negative, result & 0x80 > 0);
         nes.cpu.acc = result as u8;
         nes.write(addr, nes.cpu.proc.tmp0);
-        nes.cpu.prefetch = Some(Cpu::fetch(nes));
         
         nes.cpu.proc.done = true;
     }
@@ -1093,7 +1075,8 @@ fn rol(nes: &mut Nes) {
                     
                     nes.cpu.status.set(StatusReg::Zero, nes.cpu.acc == 0);
                     nes.cpu.status.set(StatusReg::Negative, nes.cpu.acc & 0x80 > 0);
-                    nes.cpu.prefetch = Some(Cpu::fetch(nes));
+                    
+                    nes.read(nes.cpu.pc);
                     nes.cpu.proc.done = true;
                 },
                 _ => ()
@@ -1108,7 +1091,6 @@ fn rol(nes: &mut Nes) {
                 nes.cpu.status.set(StatusReg::Zero, nes.cpu.proc.tmp0 == 0);
                 nes.cpu.status.set(StatusReg::Negative, nes.cpu.proc.tmp0 & 0x80 > 0);
                 nes.write(addr, nes.cpu.proc.tmp0);
-                nes.cpu.prefetch = Some(Cpu::fetch(nes));
                 
                 nes.cpu.proc.done = true;
             }
@@ -1126,7 +1108,8 @@ fn ror(nes: &mut Nes) {
                     
                     nes.cpu.status.set(StatusReg::Zero, nes.cpu.acc == 0);
                     nes.cpu.status.set(StatusReg::Negative, nes.cpu.acc & 0x80 > 0);
-                    nes.cpu.prefetch = Some(Cpu::fetch(nes));
+                    
+                    nes.read(nes.cpu.pc);
                     nes.cpu.proc.done = true;
                 },
                 _ => ()
@@ -1141,7 +1124,6 @@ fn ror(nes: &mut Nes) {
                 nes.cpu.status.set(StatusReg::Zero, nes.cpu.proc.tmp0 == 0);
                 nes.cpu.status.set(StatusReg::Negative, nes.cpu.proc.tmp0 & 0x80 > 0);
                 nes.write(addr, nes.cpu.proc.tmp0);
-                nes.cpu.prefetch = Some(Cpu::fetch(nes));
                 
                 nes.cpu.proc.done = true;
             }
@@ -1150,8 +1132,8 @@ fn ror(nes: &mut Nes) {
 }
 fn rti(nes: &mut Nes) {
     match nes.cpu.proc.cycle {
-        2 => {Cpu::fetch(nes);},
-        3 => {nes.read(0x100 + nes.cpu.sp.0 as u16);}
+        2 => { Cpu::fetch(nes); },
+        3 => { nes.read(0x100 + nes.cpu.sp.0 as u16); }
         4 => {
             nes.cpu.status.bits = Cpu::stack_pull(nes) & 0b11001111; //TODO: Verify bits [5:4] are supposed to be ignored by PLP
             nes.cpu.status.bits |= 0b00100000; // Apparently, bit 5 should always be set
@@ -1161,7 +1143,6 @@ fn rti(nes: &mut Nes) {
             nes.cpu.proc.tmp1 = Cpu::stack_pull(nes);
             
             nes.cpu.pc = addr_concat(nes.cpu.proc.tmp1, nes.cpu.proc.tmp0);
-            nes.cpu.prefetch = Some(Cpu::fetch(nes));
             
             nes.cpu.proc.done = true;
         }
@@ -1170,14 +1151,15 @@ fn rti(nes: &mut Nes) {
 }
 fn rts(nes: &mut Nes) {
     match nes.cpu.proc.cycle {
-        2 => {Cpu::fetch(nes);},
-        3 => {nes.read(0x100 + nes.cpu.sp.0 as u16);}
+        2 => { Cpu::fetch(nes); },
+        3 => { nes.read(0x100 + nes.cpu.sp.0 as u16); }
         4 => nes.cpu.proc.tmp0 = Cpu::stack_pull(nes),
         5 => nes.cpu.proc.tmp1 = Cpu::stack_pull(nes),
         6 => {
             nes.cpu.pc = addr_concat(nes.cpu.proc.tmp1, nes.cpu.proc.tmp0) + 1;
             nes.read(nes.cpu.pc);
-            nes.cpu.prefetch = Some(Cpu::fetch(nes));
+            //nes.cpu.predecode = Some(Cpu::fetch(nes));
+            //TODO: might need to rework this cycle implementation. (tmp1, tmp0) may need to be read first, then set PC to (tmp1, tmp0 + 1)
             
             nes.cpu.proc.done = true;
         }
@@ -1187,7 +1169,7 @@ fn rts(nes: &mut Nes) {
 fn sax(nes: &mut Nes) {
     if let Some(addr) = effective_addr(nes) {
         nes.write(addr, nes.cpu.acc & nes.cpu.x);
-        nes.cpu.prefetch = Some(Cpu::fetch(nes));
+        
         nes.cpu.proc.done = true;
     }
 }
@@ -1203,8 +1185,6 @@ fn sbc(nes: &mut Nes) {
         nes.cpu.status.set(StatusReg::Negative, result & 0x80 > 0);
         nes.cpu.acc = result as u8;
         
-        nes.cpu.prefetch = Some(Cpu::fetch(nes));
-        
         nes.cpu.proc.done = true;
     }
 }
@@ -1213,7 +1193,8 @@ fn sec(nes: &mut Nes) {
     match nes.cpu.proc.cycle {
         2 => {
             nes.cpu.status.set(StatusReg::Carry, true);
-            nes.cpu.prefetch = Some(Cpu::fetch(nes));
+            
+            nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
         },
         _ => ()
@@ -1223,7 +1204,8 @@ fn sed(nes: &mut Nes) {
     match nes.cpu.proc.cycle {
         2 => {
             nes.cpu.status.set(StatusReg::Decimal, true);
-            nes.cpu.prefetch = Some(Cpu::fetch(nes));
+            
+            nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
         },
         _ => ()
@@ -1233,7 +1215,8 @@ fn sei(nes: &mut Nes) {
     match nes.cpu.proc.cycle {
         2 => {
             nes.cpu.status.set(StatusReg::InterruptDisable, true);
-            nes.cpu.prefetch = Some(Cpu::fetch(nes));
+            
+            nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
         },
         _ => ()
@@ -1253,7 +1236,6 @@ fn slo(nes: &mut Nes) {
         nes.cpu.status.set(StatusReg::Zero, nes.cpu.acc == 0);
         nes.cpu.status.set(StatusReg::Negative, nes.cpu.acc & 0x80 > 0);
         nes.write(addr, nes.cpu.proc.tmp0);
-        nes.cpu.prefetch = Some(Cpu::fetch(nes));
         
         nes.cpu.proc.done = true;
     }
@@ -1268,7 +1250,6 @@ fn sre(nes: &mut Nes) {
         nes.cpu.status.set(StatusReg::Zero, nes.cpu.acc == 0);
         nes.cpu.status.set(StatusReg::Negative, nes.cpu.acc & 0x80 > 0);
         nes.write(addr, nes.cpu.proc.tmp0);
-        nes.cpu.prefetch = Some(Cpu::fetch(nes));
         
         nes.cpu.proc.done = true;
     }
@@ -1279,7 +1260,7 @@ fn sta(nes: &mut Nes) {
             return; // consume extra cycle write-instruction using AbsoluteX, AbsoluteY, or IndirectY
         }
         nes.write(addr, nes.cpu.acc);
-        nes.cpu.prefetch = Some(Cpu::fetch(nes));
+        
         nes.cpu.proc.done = true;
     }
 }
@@ -1289,7 +1270,7 @@ fn stx(nes: &mut Nes) {
             return; // consume extra cycle write-instruction using AbsoluteX or AbsoluteY
         }
         nes.write(addr, nes.cpu.x);
-        nes.cpu.prefetch = Some(Cpu::fetch(nes));
+        
         nes.cpu.proc.done = true;
     }
 }
@@ -1299,7 +1280,7 @@ fn sty(nes: &mut Nes) {
             return; // consume extra cycle write-instruction using AbsoluteX or AbsoluteY
         }
         nes.write(addr, nes.cpu.y);
-        nes.cpu.prefetch = Some(Cpu::fetch(nes));
+        
         nes.cpu.proc.done = true;
     }
 }
@@ -1310,7 +1291,8 @@ fn tax(nes: &mut Nes) {
             
             nes.cpu.status.set(StatusReg::Zero, nes.cpu.x == 0);
             nes.cpu.status.set(StatusReg::Negative, nes.cpu.x & 0x80 > 0);
-            nes.cpu.prefetch = Some(Cpu::fetch(nes));
+            
+            nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
         },
         _ => ()
@@ -1323,7 +1305,8 @@ fn tay(nes: &mut Nes) {
             
             nes.cpu.status.set(StatusReg::Zero, nes.cpu.y == 0);
             nes.cpu.status.set(StatusReg::Negative, nes.cpu.y & 0x80 > 0);
-            nes.cpu.prefetch = Some(Cpu::fetch(nes));
+            
+            nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
         },
         _ => ()
@@ -1336,7 +1319,8 @@ fn tsx(nes: &mut Nes) {
             
             nes.cpu.status.set(StatusReg::Zero, nes.cpu.x == 0);
             nes.cpu.status.set(StatusReg::Negative, nes.cpu.x & 0x80 > 0);
-            nes.cpu.prefetch = Some(Cpu::fetch(nes));
+            
+            nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
         },
         _ => ()
@@ -1349,7 +1333,8 @@ fn txa(nes: &mut Nes) {
             
             nes.cpu.status.set(StatusReg::Zero, nes.cpu.acc == 0);
             nes.cpu.status.set(StatusReg::Negative, nes.cpu.acc & 0x80 > 0);
-            nes.cpu.prefetch = Some(Cpu::fetch(nes));
+            
+            nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
         },
         _ => ()
@@ -1359,7 +1344,8 @@ fn txs(nes: &mut Nes) {
     match nes.cpu.proc.cycle {
         2 => {
             nes.cpu.sp.0 = nes.cpu.x;
-            nes.cpu.prefetch = Some(Cpu::fetch(nes));
+            
+            nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
         },
         _ => ()
@@ -1372,7 +1358,8 @@ fn tya(nes: &mut Nes) {
             
             nes.cpu.status.set(StatusReg::Zero, nes.cpu.acc == 0);
             nes.cpu.status.set(StatusReg::Negative, nes.cpu.acc & 0x80 > 0);
-            nes.cpu.prefetch = Some(Cpu::fetch(nes));
+            
+            nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
         },
         _ => ()

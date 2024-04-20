@@ -1,35 +1,124 @@
-use std::time::Instant;
-use argh::FromArgs;
+use std::cmp::min;
+use std::str::FromStr;
+use std::time::{Duration, Instant};
+use log::{debug, info, LevelFilter};
+use clap::Parser;
+use minifb::{Key, Scale, ScaleMode, Window, WindowOptions};
 use crate::arch::mappers::RomFile;
 use crate::arch::{CpuBusAccessible, Nes};
 
 pub mod arch;
+pub mod logger;
 
-#[derive(FromArgs)]
-/// Reach new heights
+#[derive(Clone, Copy, Debug)]
+enum ScaleArg {
+    FitScreen,
+    X1,
+    X2,
+    X4,
+    X8,
+    X16,
+    X32,
+}
+impl FromStr for ScaleArg {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        use ScaleArg::*;
+        match s.to_uppercase().as_str() {
+            "FITSCREEN" | "FIT" => Ok(FitScreen),
+            "X1" => Ok(X1),
+            "X2" => Ok(X2),
+            "X4" => Ok(X4),
+            "X8" => Ok(X8),
+            "X16" => Ok(X16),
+            "X32" => Ok(X32),
+            _ => Err("Expected fitscreen|x1|x2|x4|x8|x16|x32".to_string())
+        }
+    }
+}
+impl From<ScaleArg> for Scale {
+    fn from(value: ScaleArg) -> Self {
+        match value {
+            ScaleArg::FitScreen => Scale::FitScreen,
+            ScaleArg::X1 => Scale::X1,
+            ScaleArg::X2 => Scale::X2,
+            ScaleArg::X4 => Scale::X4,
+            ScaleArg::X8 => Scale::X8,
+            ScaleArg::X16 => Scale::X16,
+            ScaleArg::X32 => Scale::X32,
+        }
+    }
+}
+impl Default for ScaleArg {
+    fn default() -> Self {
+        Self::X2
+    }
+}
+
+#[derive(Debug, Parser)]
+#[command(author, version, about)]
 struct Args {
-    /// path to NES ROM
-    #[argh(positional)]
-    rom: String,
+    pub rom: String,
+    
+    #[arg(long, short)]
+    pub verbose: Option<LevelFilter>,
+    
+    #[arg(long, short)]
+    pub scale: Option<ScaleArg>,
 }
 
 fn main() {
-    let args: Args = argh::from_env();
+    let args = Args::parse();
+    
+    // Setup program-wide logger format
+    {
+        let mut logbuilder = logger::builder();
+        logbuilder.filter_level(args.verbose.unwrap_or(LevelFilter::Debug));
+        logbuilder.init();
+    }
+    
+    let mut window = Window::new(
+        "NESiR",
+        256,
+        240,
+        WindowOptions {
+            borderless: false,
+            title: true,
+            resize: false,
+            scale: args.scale.unwrap_or_default().into(),
+            scale_mode: ScaleMode::AspectRatioStretch,
+            topmost: false,
+            transparency: false,
+            none: false,
+        },
+    ).expect("failed to initialize window");
+    window.limit_update_rate(None);
     
     let mut nes = Nes::new();
     nes.load_rom(RomFile::new(std::fs::read(args.rom).unwrap()));
     
-    loop {
+    let fb = [0x00555555u32; 256 * 240];
+    
+    while window.is_open() && !window.is_key_down(Key::Escape) {
         let start = Instant::now();
         
-        for _ in 0..21477272 {
+        //for i in 0..21477272 {
+        for i in 0..357654 {
             nes.tick();
         }
         
+        window.update_with_buffer(&fb, 256, 240).unwrap();
         let elapsed = start.elapsed();
-        println!("time to simulate 1 second: {:.6}sec ({}us)", start.elapsed().as_secs_f64(), elapsed.as_micros());
+        debug!("time to simulate 1 frame: {:.6}sec ({}us)", start.elapsed().as_secs_f64(), elapsed.as_micros());
     }
 }
+
+
+
+
+
+
+
 
 
 
@@ -61,10 +150,11 @@ impl TestState {
 
 #[cfg(test)]
 mod tests {
+    use log::LevelFilter;
     use crate::arch::cpu::{Cpu, StatusReg};
     use crate::arch::mappers::RomFile;
-    use crate::arch::Nes;
-    use crate::TestState;
+    use crate::arch::{CpuBusAccessible, Nes};
+    use crate::{logger, TestState};
 
     #[derive(Debug, Eq, PartialEq)]
     pub enum TestError {
@@ -134,6 +224,13 @@ mod tests {
     
     #[test]
     fn nestest() {
+        // Setup program-wide logger format
+        {
+            let mut logbuilder = logger::builder();
+            logbuilder.filter_level(LevelFilter::Trace);
+            logbuilder.init();
+        }
+        
         let rom = RomFile::new(include_bytes!("../testroms/nestest.nes"));
         
         let log = include_str!("../testroms/nestest.log");
@@ -144,7 +241,7 @@ mod tests {
         
         nes.cart.mapper = rom.into_mapper();
         nes.cpu.pc = 0xC000;
-        nes.cpu.prefetch = Some(Cpu::fetch(&mut nes));
+        nes.cpu.predecode = nes.read(nes.cpu.pc);
         nes.cpu.cyc = 7;
         nes.ppu.pos = crate::arch::ppu::PixelPos { cycle: 19, scanline: 0 };
         nes.cpu.status = StatusReg::from_bits_truncate(0x24);
