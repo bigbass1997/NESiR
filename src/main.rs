@@ -1,7 +1,6 @@
-use std::cmp::min;
 use std::str::FromStr;
-use std::time::{Duration, Instant};
-use log::{debug, info, LevelFilter};
+use std::time::Instant;
+use log::{debug, LevelFilter};
 use clap::Parser;
 use minifb::{Key, Scale, ScaleMode, Window, WindowOptions};
 use crate::arch::mappers::RomFile;
@@ -102,13 +101,13 @@ fn main() {
     while window.is_open() && !window.is_key_down(Key::Escape) {
         let start = Instant::now();
         
-        //for i in 0..21477272 {
-        for i in 0..357654 {
+        //for _ in 0..21477272 {
+        for _ in 0..357654 {
             nes.tick();
         }
         
-        window.update_with_buffer(&fb, 256, 240).unwrap();
         let elapsed = start.elapsed();
+        window.update_with_buffer(&fb, 256, 240).unwrap();
         debug!("time to simulate 1 frame: {:.6}sec ({}us)", start.elapsed().as_secs_f64(), elapsed.as_micros());
     }
 }
@@ -149,12 +148,12 @@ impl TestState {
 }
 
 #[cfg(test)]
+#[cfg(not(feature = "tomharte"))]
 mod tests {
-    use log::LevelFilter;
     use crate::arch::cpu::{Cpu, StatusReg};
     use crate::arch::mappers::RomFile;
     use crate::arch::{CpuBusAccessible, Nes};
-    use crate::{logger, TestState};
+    use crate::TestState;
 
     #[derive(Debug, Eq, PartialEq)]
     pub enum TestError {
@@ -224,12 +223,11 @@ mod tests {
     
     #[test]
     fn nestest() {
-        // Setup program-wide logger format
-        {
+        /*{
             let mut logbuilder = logger::builder();
             logbuilder.filter_level(LevelFilter::Trace);
             logbuilder.init();
-        }
+        }*/
         
         let rom = RomFile::new(include_bytes!("../testroms/nestest.nes"));
         
@@ -265,5 +263,161 @@ mod tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "tomharte")]
+mod cputests {
+    use std::error::Error;
+    use std::fs::File;
+    use std::num::Wrapping;
+    use log::trace;
+    use serde::{Deserialize, Serialize};
+    use crate::arch::cpu::{Cpu, StatusReg};
+    use crate::arch::Nes;
+    
+    #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    struct State {
+        pc: u16,
+        s: u8,
+        a: u8,
+        x: u8,
+        y: u8,
+        p: u8,
+        ram: Vec<(u16, u8)>,
+    }
+    impl From<&Cpu> for State {
+        fn from(cpu: &Cpu) -> Self {
+            let mut ram = Vec::with_capacity(8);
+            for (addr, data) in cpu.wram.into_iter().enumerate() {
+                if data != 0 {
+                    ram.push((addr as u16, data));
+                }
+            }
+            
+            Self {
+                pc: cpu.pc,
+                s: cpu.sp.0,
+                a: cpu.acc,
+                x: cpu.x,
+                y: cpu.y,
+                p: cpu.status.bits(),
+                ram,
+            }
+        }
+    }
+    impl PartialEq<Cpu> for State {
+        fn eq(&self, other: &Cpu) -> bool {
+            if self.pc != other.pc { return false; }
+            if self.s != other.sp.0 { return false; }
+            if self.a != other.acc { return false; }
+            if self.x != other.x { return false; }
+            if self.y != other.y { return false; }
+            if self.p != other.status.bits() { return false; }
+            
+            for (addr, data) in other.wram.into_iter().enumerate() {
+                match self.ram.iter().find(|(s_addr, _)| *s_addr as usize == addr) {
+                    Some((_, s_data)) if *s_data != data => { return false; },
+                    None if data != 0 => { return false; },
+                    _ => ()
+                }
+            }
+            
+            true
+        }
+    }
+    
+    #[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize)]
+    enum ReadWrite {
+        #[serde(rename = "read")]
+        Read,
+        #[serde(rename = "write")]
+        Write,
+    }
+    impl From<bool> for ReadWrite {
+        fn from(value: bool) -> Self {
+            if value { Self::Read } else { Self::Write }
+        }
+    }
+    
+    #[derive(Debug, Serialize, Deserialize)]
+    struct TestData {
+        name: String,
+        initial: State,
+        #[serde(rename = "final")]
+        final_: State,
+        cycles: Vec<(u16, u8, ReadWrite)>,
+    }
+    
+    #[test]
+    #[cfg(feature = "tomharte")]
+    fn tomharte() -> Result<(), Box<dyn Error>> {
+        let mut handles = Vec::with_capacity(256);
+        for entry in walkdir::WalkDir::new("tomharte")
+            .sort_by_file_name()
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+            .filter(|e| {
+                let opcode = u8::from_str_radix(&e.path().file_stem().unwrap().to_string_lossy(), 16).unwrap();
+                //if opcode != 0x00 { return false; }
+                
+                ![
+                    0x02, 0x12, 0x22, 0x32, 0x42, 0x52, 0x62, 0x72, 0x92, 0xB2, 0xd2, 0xF2, // jams
+                    0x0B, 0x2B, 0x4B, 0x6B, 0x8B, // ANC, ALR, ARR, ANE (illegals)
+                    0x93, 0x9B, 0x9C, 0x9E, 0x9F, // SHA, SHS, SHY, SHX (illegals)
+                    0xAB, 0xCB, // LXA, SBX (illegals)
+                ].contains(&opcode)
+            }){
+            
+            // TODO: Change to build.rs script to generate individual tests, letting cargo parallelize this automatically
+            handles.push(std::thread::spawn(|| {
+                let tests: Vec<TestData> = simd_json::from_reader(File::open(entry.into_path()).unwrap()).unwrap();
+                for test in tests {
+                    trace!("testing: {} ({})", test.name, test.cycles.len());
+                    let mut nes = Nes::new();
+                    
+                    nes.cpu.pc = test.initial.pc;
+                    nes.cpu.sp = Wrapping(test.initial.s);
+                    nes.cpu.acc = test.initial.a;
+                    nes.cpu.x = test.initial.x;
+                    nes.cpu.y = test.initial.y;
+                    nes.cpu.status = StatusReg::from_bits_truncate(test.initial.p);
+                    for (addr, data) in &test.initial.ram {
+                        nes.cpu.wram[*addr as usize] = *data;
+                    }
+                    assert!(test.initial == nes.cpu, " left: {:X?}\nright: {:X?}", test.initial, State::from(&nes.cpu));
+                    trace!("init: {:X?}", State::from(&nes.cpu));
+                    
+                    fn test_cycle(cyc: usize, test: &TestData, nes: &Nes) {
+                        let (addr, data, is_read) = nes.last_bus;
+                        
+                        trace!("({addr:04X}, {data:02X}, {:?})", if is_read { "read" } else { "write" });
+                        assert!(test.cycles[cyc] == (addr, data, ReadWrite::from(is_read)), " left: {:X?}\nright: {:X?}", test.cycles[cyc], (addr, data, ReadWrite::from(is_read)));
+                    }
+                    
+                    Cpu::cycle(&mut nes);
+                    test_cycle(0, &test, &nes);
+                    
+                    let mut cyc = 1;
+                    while !nes.cpu.proc.done {
+                        Cpu::cycle(&mut nes);
+                        test_cycle(cyc, &test, &nes);
+                        cyc += 1;
+                        
+                        assert!(nes.cpu.proc.cycle < 10, "cycle runaway! instruction may be stuck in a loop");
+                    }
+                    
+                    assert!(test.final_ == nes.cpu, " left: {:X?}\nright: {:X?}", test.final_, State::from(&nes.cpu));
+                }
+            }));
+        }
+        
+        for handle in handles {
+            handle.join().unwrap();
+        }
+        
+        Ok(())
     }
 }

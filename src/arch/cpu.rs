@@ -78,7 +78,7 @@ pub struct InstructionProcedure {
     pub done: bool,
     func: fn(&mut Nes),
     mode: AddrMode,
-    cycle: u8,
+    pub(crate) cycle: u8,
     tmp0: u8,
     tmp1: u8,
     tmp_addr: u16,
@@ -113,6 +113,9 @@ impl InstructionProcedure {
 
 #[derive(Clone, Debug)]
 pub struct Cpu {
+    #[cfg(feature = "tomharte")]
+    pub wram: [u8; 0x10000],
+    #[cfg(not(feature = "tomharte"))]
     pub wram: [u8; 0x800],
     pub pc: u16,
     pub sp: Wrapping<u8>,
@@ -126,7 +129,7 @@ pub struct Cpu {
     pub nmi: bool,
     /// Predecode Register (PD)
     pub(crate) predecode: u8,
-    proc: InstructionProcedure,
+    pub(crate) proc: InstructionProcedure,
     pub clock_divider: ClockDivider<12>,
     pub cyc: usize,
     pub last_state: Option<TestState>,
@@ -137,6 +140,9 @@ impl Default for Cpu {
         proc.done = true;
         
         Self {
+            #[cfg(feature = "tomharte")]
+            wram: [0u8; 0x10000],
+            #[cfg(not(feature = "tomharte"))]
             wram: [0u8; 0x800],
             pc: 0,
             sp: Wrapping(0xFD), // actually this is potentialy random at power-on // software typically initializes this to 0xFF
@@ -173,6 +179,9 @@ impl Cpu {
         if !nes.cpu.rdy {
             return;
         }
+        
+        //#[cfg(feature = "tomharte")]
+        //println!("PC: {:04X}, Op: {:02X}, Status: {}, ACC: {:02X}, X: {:02X}, Y: {:02X}, SP: {:02X}, PPU: {}, CYC: {}", nes.cpu.pc - 1, nes.cpu.predecode, nes.cpu.status, nes.cpu.acc, nes.cpu.x, nes.cpu.y, nes.cpu.sp, nes.ppu.pos, nes.cpu.cyc);
         
         if nes.cpu.proc.done {
             Cpu::fetch(nes);
@@ -441,8 +450,11 @@ impl Cpu {
                 _ => panic!("Attempt to run invalid/unimplemented opcode! PC: {:#06X}, Op: {:#06X}", nes.cpu.pc, nes.cpu.predecode)
             };
             
-            nes.cpu.last_state = Some(TestState::from_nes(nes.clone()));
-            trace!("         PC: {:04X}, Op: {:02X}, Status: {}, ACC: {:02X}, X: {:02X}, Y: {:02X}, SP: {:02X}, PPU: {}, CYC: {}", nes.cpu.pc - 1, nes.cpu.predecode, nes.cpu.status, nes.cpu.acc, nes.cpu.x, nes.cpu.y, nes.cpu.sp, nes.ppu.pos, nes.cpu.cyc);
+            #[cfg(test)]
+            {
+                nes.cpu.last_state = Some(TestState::from_nes(nes.clone()));
+                trace!("         PC: {:04X}, Op: {:02X}, Status: {}, ACC: {:02X}, X: {:02X}, Y: {:02X}, SP: {:02X}, PPU: {}, CYC: {}", nes.cpu.pc - 1, nes.cpu.predecode, nes.cpu.status, nes.cpu.acc, nes.cpu.x, nes.cpu.y, nes.cpu.sp, nes.ppu.pos, nes.cpu.cyc);
+            }
             
             nes.cpu.proc.cycle = 2; // the decode above costs 1 cycle
         } else {
@@ -469,6 +481,7 @@ impl Cpu {
         nes.read(0x100 + nes.cpu.sp.0 as u16)
     }
 }
+#[cfg(not(feature = "tomharte"))]
 impl CpuBusAccessible for Cpu {
     fn write(&mut self, addr: u16, data: u8) {
         match addr {
@@ -482,6 +495,17 @@ impl CpuBusAccessible for Cpu {
             0x0000..=0x1FFF => self.wram[(addr & 0x07FF) as usize],
             _ => panic!("Read attempt to invalid address {:#06X}", addr),
         }
+    }
+}
+
+#[cfg(feature = "tomharte")]
+impl CpuBusAccessible for Cpu {
+    fn write(&mut self, addr: u16, data: u8) {
+        self.wram[addr as usize] = data;
+    }
+
+    fn read(&mut self, addr: u16) -> u8 {
+        self.wram[addr as usize]
     }
 }
 
@@ -578,7 +602,7 @@ fn bpl(nes: &mut Nes) {
 }
 fn brk(nes: &mut Nes) {
     match nes.cpu.proc.cycle {
-        2 => { Cpu::fetch(nes); },
+        2 => { Cpu::fetch(nes); }, // TODO: do NOT increment on hardware interrupts
         3 => Cpu::stack_push(nes, (nes.cpu.pc >> 8) as u8),
         4 => Cpu::stack_push(nes, nes.cpu.pc as u8),
         5 => Cpu::stack_push(nes, nes.cpu.status.bits | 0b00010000),
@@ -587,6 +611,7 @@ fn brk(nes: &mut Nes) {
             nes.cpu.proc.tmp1 = nes.read(0xFFFF);
             
             nes.cpu.pc = ((nes.cpu.proc.tmp1 as u16) << 8) | (nes.cpu.proc.tmp0 as u16);
+            nes.cpu.status.set(StatusReg::InterruptDisable, true); // masswerk has conflicting statements, and 6502_cpu.txt says the I flag should be set here
             
             nes.cpu.proc.done = true;
         }
@@ -601,7 +626,6 @@ fn bvs(nes: &mut Nes) {
 }
 
 fn branch(nes: &mut Nes, to_branch: bool) {
-    let Nes { cpu, .. } = nes;
     match nes.cpu.proc.cycle {
         2 => {
             nes.cpu.proc.tmp0 = Cpu::fetch(nes);
@@ -610,18 +634,19 @@ fn branch(nes: &mut Nes, to_branch: bool) {
             }
         },
         3 => {
+            nes.read(nes.cpu.pc);
             nes.cpu.proc.tmp_addr = (nes.cpu.pc as i16 + nes.cpu.proc.tmp0 as i8 as i16) as u16;
             if (nes.cpu.pc & 0xFF00) == (nes.cpu.proc.tmp_addr & 0xFF00) { // branch to same page
                 nes.cpu.pc = nes.cpu.proc.tmp_addr;
                 
-                nes.read(nes.cpu.pc);
                 nes.cpu.proc.done = true;
             }
         },
         4 => {
+            nes.read((nes.cpu.pc & 0xFF00) + (nes.cpu.proc.tmp_addr & 0x00FF)); // read from PC + 2 + offset (without carry)
+            
             nes.cpu.pc = nes.cpu.proc.tmp_addr;
             
-            nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
         },
         _ => ()
@@ -965,8 +990,8 @@ fn nop(nes: &mut Nes) {
             nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
         }
-    } else if let Some(_) = effective_addr(nes) {
-        nes.read(nes.cpu.pc);
+    } else if let Some(addr) = effective_addr(nes) {
+        nes.read(addr);
         nes.cpu.proc.done = true;
     }
 }
@@ -1156,10 +1181,8 @@ fn rts(nes: &mut Nes) {
         4 => nes.cpu.proc.tmp0 = Cpu::stack_pull(nes),
         5 => nes.cpu.proc.tmp1 = Cpu::stack_pull(nes),
         6 => {
+            nes.read(addr_concat(nes.cpu.proc.tmp1, nes.cpu.proc.tmp0));
             nes.cpu.pc = addr_concat(nes.cpu.proc.tmp1, nes.cpu.proc.tmp0) + 1;
-            nes.read(nes.cpu.pc);
-            //nes.cpu.predecode = Some(Cpu::fetch(nes));
-            //TODO: might need to rework this cycle implementation. (tmp1, tmp0) may need to be read first, then set PC to (tmp1, tmp0 + 1)
             
             nes.cpu.proc.done = true;
         }
@@ -1257,6 +1280,7 @@ fn sre(nes: &mut Nes) {
 fn sta(nes: &mut Nes) {
     if let Some(addr) = effective_addr(nes) {
         if ((nes.cpu.proc.mode == AbsoluteX || nes.cpu.proc.mode == AbsoluteY) && nes.cpu.proc.cycle == 4) || (nes.cpu.proc.mode == IndirectY && nes.cpu.proc.cycle == 5) {
+            nes.read(addr);
             return; // consume extra cycle write-instruction using AbsoluteX, AbsoluteY, or IndirectY
         }
         nes.write(addr, nes.cpu.acc);
@@ -1448,7 +1472,8 @@ fn effective_addr(nes: &mut Nes) -> Option<u16> {
                     };
                     
                     let (result, carry) = nes.cpu.proc.tmp0.overflowing_add(index);
-                    nes.cpu.proc.tmp_addr = addr_concat(nes.cpu.proc.tmp1 + carry as u8, result);
+                    nes.cpu.proc.tmp_addr = addr_concat(nes.cpu.proc.tmp1, result);
+                    nes.cpu.proc.tmp1 = carry as u8;
                     
                     if !carry {
                         Some(nes.cpu.proc.tmp_addr)
@@ -1457,7 +1482,7 @@ fn effective_addr(nes: &mut Nes) -> Option<u16> {
                         None
                     }
                 },
-                5 => Some(nes.cpu.proc.tmp_addr),
+                5 => Some(nes.cpu.proc.tmp_addr + ((nes.cpu.proc.tmp1 as u16) << 8)),
                 _ => None
             }
         },
@@ -1497,7 +1522,8 @@ fn effective_addr(nes: &mut Nes) -> Option<u16> {
                 },
                 5 => {
                     let (result, carry) = nes.cpu.proc.tmp0.overflowing_add(nes.cpu.y);
-                    nes.cpu.proc.tmp_addr = addr_concat(nes.cpu.proc.tmp1 + carry as u8, result);
+                    nes.cpu.proc.tmp_addr = addr_concat(nes.cpu.proc.tmp1, result);
+                    nes.cpu.proc.tmp1 = carry as u8;
                     
                     if !carry {
                         Some(nes.cpu.proc.tmp_addr)
@@ -1506,7 +1532,7 @@ fn effective_addr(nes: &mut Nes) -> Option<u16> {
                         None
                     }
                 },
-                6 => Some(nes.cpu.proc.tmp_addr),
+                6 => Some(nes.cpu.proc.tmp_addr + ((nes.cpu.proc.tmp1 as u16) << 8)),
                 _ => None
             }
         },
@@ -1597,8 +1623,8 @@ fn read_modify_write(nes: &mut Nes) -> Option<u16> {
                     None
                 },
                 4 => {
-                    nes.cpu.proc.tmp_addr = addr_concat(nes.cpu.proc.tmp1, nes.cpu.proc.tmp0) + nes.cpu.x as u16; //TODO: Revisit whether carry needs to be added to upper or not
-                    nes.read(nes.cpu.proc.tmp_addr);
+                    nes.read(addr_concat(nes.cpu.proc.tmp1, nes.cpu.proc.tmp0 + nes.cpu.x));
+                    nes.cpu.proc.tmp_addr = addr_concat(nes.cpu.proc.tmp1, nes.cpu.proc.tmp0) + nes.cpu.x as u16;
                     None
                 },
                 5 => {
@@ -1687,8 +1713,8 @@ fn read_modify_write(nes: &mut Nes) -> Option<u16> {
                     None
                 },
                 4 => {
-                    nes.cpu.proc.tmp_addr = addr_concat(nes.cpu.proc.tmp1, nes.cpu.proc.tmp0) + nes.cpu.y as u16; //TODO: Revisit whether carry needs to be added to upper or not
-                    nes.read(nes.cpu.proc.tmp_addr);
+                    nes.read(addr_concat(nes.cpu.proc.tmp1, nes.cpu.proc.tmp0 + nes.cpu.y));
+                    nes.cpu.proc.tmp_addr = addr_concat(nes.cpu.proc.tmp1, nes.cpu.proc.tmp0) + nes.cpu.y as u16;
                     None
                 },
                 5 => {

@@ -32,6 +32,9 @@ pub struct Nes {
     pub cpu: Cpu,
     pub ppu: Ppu,
     pub cart: Cartridge,
+    
+    #[cfg(feature = "tomharte")]
+    pub last_bus: (u16, u8, bool), // addr, data, is_read
 }
 impl Nes {
     pub fn new() -> Self {
@@ -49,6 +52,8 @@ impl Nes {
         Cpu::init_pc(self);
     }
 }
+
+#[cfg(not(feature = "tomharte"))]
 impl CpuBusAccessible for Nes {
     fn write(&mut self, addr: u16, data: u8) {
         self.cpu.predecode = data;
@@ -90,6 +95,26 @@ impl CpuBusAccessible for Nes {
     }
 }
 
+#[cfg(feature = "tomharte")]
+impl CpuBusAccessible for Nes {
+    fn write(&mut self, addr: u16, data: u8) {
+        self.cpu.predecode = data;
+        
+        self.cpu.write(addr, data);
+        
+        self.last_bus = (addr, data, false);
+    }
+
+    fn read(&mut self, addr: u16) -> u8 {
+        let val = self.cpu.read(addr);
+        
+        self.cpu.predecode = val;
+        
+        self.last_bus = (addr, val, true);
+        
+        val
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ClockDivider<const N: usize> {
