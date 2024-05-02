@@ -11,6 +11,9 @@ pub struct Mapper000 {
     /// Family Basic only, but seems most emus provide 8 KiB?
     pub prg_ram: [u8; 0x2000],
     pub prg_rom: [u8; 0x8000],
+    pub chr_rom: [u8; 0x2000],
+    //pub ciram_a10: bool,
+    //pub ciram__ce: bool,
 }
 impl Mapper for Mapper000 {
     fn new(rom: RomFile) -> Box<dyn Mapper> {
@@ -23,6 +26,12 @@ impl Mapper for Mapper000 {
                 data.try_into().unwrap()
             } else {
                 rom.prg.try_into().unwrap()
+            },
+            chr_rom: {
+                let mut data = rom.chr.clone();
+                data.resize(0x2000, 0);
+                
+                data.try_into().unwrap()
             },
         })
     }
@@ -43,8 +52,11 @@ impl Mapper for Mapper000 {
         }
     }
     
-    fn read_ppu(&mut self, _addr: u16) -> u8 {
-        0 // open bus?
+    fn read_ppu(&mut self, addr: u16) -> u8 {
+        match addr {
+            0x0000..=0x1FFF => self.chr_rom[addr as usize],
+            _ => unimplemented!()
+        }
     }
     
     fn write_ppu(&mut self, _addr: u16, _data: u8) {

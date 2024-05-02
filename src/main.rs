@@ -1,6 +1,7 @@
+use std::path::PathBuf;
 use std::str::FromStr;
-use std::time::Instant;
-use log::{debug, LevelFilter};
+use std::time::{Duration, Instant};
+use log::{LevelFilter, trace};
 use clap::Parser;
 use minifb::{Key, Scale, ScaleMode, Window, WindowOptions};
 use crate::arch::mappers::RomFile;
@@ -64,6 +65,9 @@ struct Args {
     
     #[arg(long, short)]
     pub scale: Option<ScaleArg>,
+    
+    #[arg(long, short)]
+    pub palette: Option<PathBuf>,
 }
 
 fn main() {
@@ -91,14 +95,83 @@ fn main() {
             none: false,
         },
     ).expect("failed to initialize window");
-    window.limit_update_rate(None);
+    window.limit_update_rate(Some(Duration::from_micros(16666)));
+    
+    let mut pattern_window = Window::new(
+        "NESiR - Pattern Table",
+        256,
+        128,
+        WindowOptions {
+            borderless: false,
+            title: true,
+            resize: false,
+            scale: args.scale.unwrap_or_default().into(),
+            scale_mode: ScaleMode::AspectRatioStretch,
+            topmost: false,
+            transparency: false,
+            none: false,
+        },
+    ).expect("failed to initialize window");
+    pattern_window.limit_update_rate(None);
+    pattern_window.set_position(2624 + 520, 200);
+    let mut pattern_fb = [0x00555555u32; 256 * 128];
+    
+    let mut nametable_window = Window::new(
+        "NESiR - Nametable",
+        64,
+        32,
+        WindowOptions {
+            borderless: false,
+            title: true,
+            resize: false,
+            scale: Scale::X8,
+            scale_mode: ScaleMode::AspectRatioStretch,
+            topmost: false,
+            transparency: false,
+            none: false,
+        },
+    ).expect("failed to initialize window");
+    nametable_window.limit_update_rate(None);
+    nametable_window.set_position(2624 + 520, 500);
+    let mut nametable_fb = [0x00555555u32; 64 * 32];
+    
+    let mut palette_window = Window::new(
+        "NESiR - Palette Memory",
+        4,
+        8,
+        WindowOptions {
+            borderless: false,
+            title: true,
+            resize: false,
+            scale: Scale::X16,
+            scale_mode: ScaleMode::AspectRatioStretch,
+            topmost: false,
+            transparency: false,
+            none: false,
+        },
+    ).expect("failed to initialize window");
+    palette_window.limit_update_rate(None);
+    palette_window.set_position(2624 + 520, 800);
+    let mut palette_fb = [0x00555555u32; 4 * 8];
+    
     
     let mut nes = Nes::new();
     nes.load_rom(RomFile::new(std::fs::read(args.rom).unwrap()));
     
-    let fb = [0x00555555u32; 256 * 240];
+    if let Some(path) = args.palette {
+        let mut colors: Vec<u32> = std::fs::read(path).unwrap()
+            .chunks_exact(3)
+            .map(|chunk| (((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | (chunk[2] as u32)))
+            .collect();
+        colors.resize(nes.ppu.pal_values.len(), 0x00000000);
+        
+        nes.ppu.pal_values.iter_mut()
+            .enumerate()
+            .for_each(|(i, val)| *val = colors[i]);
+    }
     
-    while window.is_open() && !window.is_key_down(Key::Escape) {
+    while window.is_open() && pattern_window.is_open() && nametable_window.is_open() && palette_window.is_open()
+        && !window.is_key_down(Key::Escape) && !pattern_window.is_key_down(Key::Escape) && !nametable_window.is_key_down(Key::Escape) && !palette_window.is_key_down(Key::Escape) {
         let start = Instant::now();
         
         //for _ in 0..21477272 {
@@ -106,9 +179,85 @@ fn main() {
             nes.tick();
         }
         
+        let fb = &mut nes.ppu.fb;
+        
+        
+        
         let elapsed = start.elapsed();
-        window.update_with_buffer(&fb, 256, 240).unwrap();
-        debug!("time to simulate 1 frame: {:.6}sec ({}us)", start.elapsed().as_secs_f64(), elapsed.as_micros());
+        window.update_with_buffer(fb, 256, 240).unwrap();
+        
+        render_pattern_table(&mut nes, &mut pattern_fb);
+        pattern_window.update_with_buffer(&pattern_fb, 256, 128).unwrap();
+        
+        render_nametable(&mut nes, &mut nametable_fb);
+        nametable_window.update_with_buffer(&nametable_fb, 64, 32).unwrap();
+        
+        render_palette(&mut nes, &mut palette_fb);
+        palette_window.update_with_buffer(&palette_fb, 4, 8).unwrap();
+        //trace!("time to simulate 1 frame: {:.6}sec ({}us)", start.elapsed().as_secs_f64(), elapsed.as_micros());
+    }
+}
+
+fn render_palette(nes: &mut Nes, fb: &mut [u32; 4 * 8]) {
+    for i in 0..fb.len() {
+        let index = nes.ppu.palettes[i] as usize;
+        fb[i] = nes.ppu.pal_values[index];
+    }
+}
+
+fn render_nametable(nes: &mut Nes, fb: &mut [u32; 64 * 32]) {
+    for i in 0..1024 {
+        let x = i % 32;
+        let y = i / 32;
+        
+        let color = nes.ppu.ciram[i] as u32;
+        fb[(y * 64) + x] = (color << 16) | (color << 8) | (color);
+    }
+    
+    for i in 1024..2048 {
+        let x = i % 32;
+        let y = i / 32;
+        
+        let color = nes.ppu.ciram[i] as u32;
+        fb[((y - 32) * 64) + (x + 32)] = (color << 16) | (color << 8) | (color);
+    }
+}
+
+fn render_pattern_table(nes: &mut Nes, fb: &mut [u32; 256 * 128]) {
+    for tile_index in (0..4096u16).step_by(16) {
+        let tile_index = tile_index / 16;
+        
+        for row in 0..8 {
+            let lsb = nes.cart.read_ppu((tile_index * 16) + row);
+            let msb = nes.cart.read_ppu((tile_index * 16) + row + 8);
+            
+            for col in 0..8usize {
+                let color_index = (((msb & (0x80 >> col)) >> (7 - col)) << 1) | ((lsb & (0x80 >> col)) >> (7 - col));
+                let color = (color_index as u32 * 64) + 63;
+                
+                let x = ((tile_index as usize % 16) * 8) + col;
+                let y = ((tile_index as usize / 16) * 8) + row as usize;
+                fb[(y * 256) + x] = (color << 16) | (color << 8) | (color);
+            }
+        }
+    }
+    
+    for tile_index in (4096..8192u16).step_by(16) {
+        let tile_index = tile_index / 16;
+        
+        for row in 0..8 {
+            let lsb = nes.cart.read_ppu((tile_index * 16) + row);
+            let msb = nes.cart.read_ppu((tile_index * 16) + row + 8);
+            
+            for col in 0..8usize {
+                let color_index = (((msb & (0x80 >> col)) >> (7 - col)) << 1) | ((lsb & (0x80 >> col)) >> (7 - col));
+                let color = (color_index as u32 * 64) + 63;
+                
+                let x = ((tile_index as usize % 16) * 8) + col;
+                let y = ((tile_index as usize / 16) * 8) + row as usize;
+                fb[((y - 128) * 256) + (x + 128)] = (color << 16) | (color << 8) | (color);
+            }
+        }
     }
 }
 

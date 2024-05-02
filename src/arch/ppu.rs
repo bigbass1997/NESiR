@@ -1,6 +1,7 @@
 use std::fmt::{Display, Formatter};
+use log::trace;
 use proc_bitfield::bitfield;
-use crate::arch::{Nes, CpuBusAccessible, ClockDivider};
+use crate::arch::{Nes, ClockDivider};
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 pub struct PixelPos {
@@ -103,9 +104,15 @@ pub struct Ppu {
     pub pos: PixelPos,
     /// aka nmi_occurred
     vblank: bool,
-    nmi_output: bool,
+    //nmi_output: bool,
     
-    ciram: [u8; 0x800],
+    pub fb: [u32; 256 * 240],
+    
+    /// Internal VRAM used for storing two nametables
+    pub ciram: [u8; 0x800],
+    pub palettes: [u8; 0x20],
+    
+    pub pal_values: [u32; 0x40],
 }
 impl Default for Ppu {
     fn default() -> Self { Self { //TODO: Research initial state of registers
@@ -126,9 +133,13 @@ impl Default for Ppu {
         
         pos: PixelPos::default(),
         vblank: false,
-        nmi_output: false,
         
-        ciram: [0x00; 0x800],
+        fb: [0u32; 256 * 240],
+        
+        ciram: [0u8; 0x800],
+        palettes: [0u8; 0x20],
+        
+        pal_values: [0u32; 0x40],
     }}
 }
 impl Ppu {
@@ -140,142 +151,162 @@ impl Ppu {
     }
     
     pub fn cycle(nes: &mut Nes) {
-        let Nes { ppu, ..} = nes;
-        
-        match ppu.pos.cycle {
-            1 if ppu.pos.scanline == 241 => ppu.vblank = true,
-            1 if ppu.pos.scanline == 261 => {
-                ppu.vblank = false;
+        match nes.ppu.pos.cycle {
+            1 if nes.ppu.pos.scanline == 241 => {
+                nes.ppu.vblank = true;
+                Ppu::update_nmi_output(nes);
+            },
+            1 if nes.ppu.pos.scanline == 261 => {
+                nes.ppu.vblank = false;
                 //TODO: clear sprite overflow and sprite 0 hit bits
             },
             _ => ()
         }
         
-        ppu.pos.inc();
-        ppu.cycles_since_pwrrst += 1;
-        if !ppu.ctrl_unlocked && ppu.cycles_since_pwrrst >= 30000 {
-            ppu.ctrl_unlocked = true;
+        nes.ppu.pos.inc();
+        nes.ppu.cycles_since_pwrrst += 1;
+        if !nes.ppu.ctrl_unlocked && nes.ppu.cycles_since_pwrrst >= 30000 {
+            nes.ppu.ctrl_unlocked = true;
         }
     }
     
-    fn read(&mut self, addr: u16) -> u8 {
+    fn update_nmi_output(nes: &mut Nes) {
+        if nes.ppu.ctrl.generate_nmi() && nes.ppu.vblank {
+            nes.cpu.nmi = false; // set LOW (NMI is active-low)
+        }
+    }
+    
+    /// Read from PPU memory map (may read into the cartridge)
+    fn read(nes: &mut Nes, addr: u16) -> u8 {
         match addr {
-            0x0000..=0x1FFF => unimplemented!("PPU read from pattern tables"),
-            0x2000..=0x3EFF => unimplemented!("PPU read from nametables"),
-            0x3F00..=0x3FFF => unimplemented!("PPU read from palette RAM indexes"),
+            0x0000..=0x1FFF => nes.cart.read_ppu(addr),
+            0x2000..=0x3EFF => {
+                nes.ppu.ciram[(addr & 0x7FF) as usize] //TODO: Implement nametable mirroring
+            }
+            0x3F00..=0x3FFF => {
+                let addr = (addr & 0x1F) as usize;
+                
+                if nes.ppu.vblank {
+                    unimplemented!("PPU read from palette RAM indexes during VBLANK")
+                } else {
+                    let addr = match addr {
+                        0x10 | 0x14 | 0x18 | 0x1C => addr & 0x0F,
+                        addr => addr,
+                    };
+                    nes.ppu.palettes[addr]
+                }
+            },
             
             _ => unreachable!()
         }
     }
     
-    fn write(&mut self, addr: u16, data: u8) {
+    /// Read to PPU memory map (may write into the cartridge)
+    fn write(nes: &mut Nes, addr: u16, data: u8) {
         match addr {
-            0x0000..=0x1FFF => unimplemented!("PPU write to pattern tables"),
-            0x2000..=0x3EFF => {
-                /*if addr >= 0x2800 {
-                    unimplemented!("PPU write {:#04X} to {:#06X} (nametables)", data, addr);
-                }*/
+            0x0000..=0x1FFF => {
+                nes.cart.write_ppu(addr, data);
                 
-                self.ciram[(addr & 0x7FF) as usize] = data;
+                trace!("PPU Pattern write {data:#04X} to {addr:#06X}");
+            },
+            0x2000..=0x3EFF => {
+                nes.ppu.ciram[(addr & 0x7FF) as usize] = data; //TODO: Implement nametable mirroring
+                
+                trace!("PPU CIRAM write {data:#04X} to {addr:#06X}");
             },
             0x3F00..=0x3FFF => {
-                //unimplemented!("PPU write to palette RAM indexes")
+                let addr = (addr & 0x1F) as usize;
+                let addr = match addr {
+                    0x10 | 0x14 | 0x18 | 0x1C => addr & 0x0F,
+                    addr => addr,
+                };
+                nes.ppu.palettes[addr] = data;
+                
+                trace!("PPU Palette write {data:#04X} to {addr:#06X}");
             },
             
             _ => unreachable!()
         }
     }
     
-    fn port_read(&mut self, addr: u16) -> u8 {
+    pub fn port_read(nes: &mut Nes, addr: u16) -> u8 {
         match addr {
             0x2000 => (),
             0x2001 => (),
             0x2002 => {
-                self.ports_latch |= (self.vblank as u8) << 7;
-                self.vblank = false;
-                self.write_toggle = false;
+                nes.ppu.ports_latch = ((nes.ppu.vblank as u8) << 7) | (nes.ppu.ports_latch & 0b00011111);
+                nes.ppu.vblank = false;
+                nes.ppu.write_toggle = false;
             }, //TODO: add sprite overflow and sprite 0 hit detection to status register
             0x2003 => (),
             0x2004 => unimplemented!("PPU read from {:#06X}", addr),
             0x2005 => (),
             0x2006 => (),
             0x2007 => {
-                self.read(self.vram_addr.0);
+                Ppu::read(nes, nes.ppu.vram_addr.0);
                 
-                let inc = if !self.ctrl.vram_addr_inc() {
+                let inc = if !nes.ppu.ctrl.vram_addr_inc() {
                     1
                 } else {
                     32
                 };
-                self.vram_addr.0 += inc;
+                nes.ppu.vram_addr.0 += inc;
             },
             
             _ => unreachable!()
         }
         
-        self.ports_latch //TODO: add latch decay over time
+        nes.ppu.ports_latch //TODO: add latch decay over time
     }
     
-    fn port_write(&mut self, addr: u16, data: u8) {
-        self.ports_latch = data;
+    pub fn port_write(nes: &mut Nes, addr: u16, data: u8) {
+        nes.ppu.ports_latch = data;
         
         match addr {
-            0x2000 => if self.ctrl_unlocked {
-                self.ctrl.0 = data;
-                //TODO: generate NMI if PPU is currently in VBLANK and PPUSTATUS[7] is still set
+            0x2000 => if nes.ppu.ctrl_unlocked {
+                nes.ppu.ctrl.0 = data;
+                
+                Ppu::update_nmi_output(nes);
             },
-            0x2001 => self.mask.0 = data,
+            0x2001 => nes.ppu.mask.0 = data,
             0x2002 => (),
-            0x2003 => self.oam_addr = data, //TODO: Add feature flag for 2C02G's OAM corruption
-            0x2004 => unimplemented!("PPU write {:#04X} to {:#06X}", data, addr),
+            0x2003 => nes.ppu.oam_addr = data, //TODO: Add feature flag for 2C02G's OAM corruption
+            0x2004 => {
+                unimplemented!("PPU write {:#04X} to {:#06X}", data, addr);
+            },
             0x2005 => {
-                if !self.write_toggle { // w = 0
-                    self.tmp_vram_addr.set_coarse_x(data >> 3);
-                    self.fine_x_scroll = data & 0b111;
+                if !nes.ppu.write_toggle { // w = 0
+                    nes.ppu.tmp_vram_addr.set_coarse_x(data >> 3);
+                    nes.ppu.fine_x_scroll = data & 0b111;
                 } else { // w = 1
-                    self.tmp_vram_addr.set_coarse_y(data >> 3);
-                    self.tmp_vram_addr.set_fine_y(data & 0b111);
+                    nes.ppu.tmp_vram_addr.set_coarse_y(data >> 3);
+                    nes.ppu.tmp_vram_addr.set_fine_y(data & 0b111);
                 }
                 
-                self.write_toggle = !self.write_toggle;
+                nes.ppu.write_toggle = !nes.ppu.write_toggle;
             },
             0x2006 => {
-                if !self.write_toggle { // w = 0
-                    self.tmp_vram_addr.0 = ((data as u16 & 0x003F) << 8) | (self.tmp_vram_addr.0 & 0x00FF);
+                if !nes.ppu.write_toggle { // w = 0
+                    nes.ppu.tmp_vram_addr.0 = ((data as u16 & 0x003F) << 8) | (nes.ppu.tmp_vram_addr.0 & 0x00FF);
                 } else { // w = 1
-                    self.tmp_vram_addr.0 = (self.tmp_vram_addr.0 & 0xFF00) | (data as u16);
-                    self.vram_addr = self.tmp_vram_addr;
+                    nes.ppu.tmp_vram_addr.0 = (nes.ppu.tmp_vram_addr.0 & 0xFF00) | (data as u16);
+                    nes.ppu.vram_addr = nes.ppu.tmp_vram_addr;
                 }
                 
-                self.write_toggle = !self.write_toggle;
+                nes.ppu.write_toggle = !nes.ppu.write_toggle;
             },
             0x2007 => {
-                self.write(self.vram_addr.0, data);
+                Ppu::write(nes, nes.ppu.vram_addr.0, data);
                 
-                let inc = if !self.ctrl.vram_addr_inc() {
+                let inc = if !nes.ppu.ctrl.vram_addr_inc() {
                     1
                 } else {
                     32
                 };
-                self.vram_addr.0 += inc;
+                nes.ppu.vram_addr.0 += inc;
             },
             
             _ => unreachable!()
-        }
-    }
-}
-
-impl CpuBusAccessible for Ppu {
-    fn write(&mut self, addr: u16, data: u8) {
-        match addr {
-            0x2000..=0x3FFF => self.port_write(addr & 0x2007, data),
-            _ => panic!("Write attempt to invalid address {:#06X} ({:#04X})", addr, data),
-        }
-    }
-    fn read(&mut self, addr: u16) -> u8 {
-        match addr {
-            0x2000..=0x3FFF => self.port_read(addr & 0x2007),
-            _ => panic!("Read attempt to invalid address {:#06X}", addr),
         }
     }
 }

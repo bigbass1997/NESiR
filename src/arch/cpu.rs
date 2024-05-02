@@ -5,7 +5,6 @@ use std::fmt::{Debug, Formatter};
 use std::num::Wrapping;
 use crate::arch::{Nes, CpuBusAccessible, ClockDivider};
 use bitflags::bitflags;
-use log::trace;
 use AddrMode::*;
 use crate::TestState;
 
@@ -133,6 +132,7 @@ pub struct Cpu {
     pub clock_divider: ClockDivider<12>,
     pub cyc: usize,
     pub last_state: Option<TestState>,
+    pub dma_upper: u8,
 }
 impl Default for Cpu {
     fn default() -> Self {
@@ -157,6 +157,7 @@ impl Default for Cpu {
             clock_divider: ClockDivider::new(0), //todo: randomize
             cyc: 0,
             last_state: None,
+            dma_upper: 0,
         }
     }
 }
@@ -176,14 +177,20 @@ impl Cpu {
     }
     
     pub fn cycle(nes: &mut Nes) {
-        if !nes.cpu.rdy {
+        if !nes.cpu.rdy && nes.last_bus.2 {
+            nes.read(nes.last_bus.0);
+            
+            nes.cpu.rdy = true; //DEBUG ONLY
             return;
         }
         
         //#[cfg(feature = "tomharte")]
         //println!("PC: {:04X}, Op: {:02X}, Status: {}, ACC: {:02X}, X: {:02X}, Y: {:02X}, SP: {:02X}, PPU: {}, CYC: {}", nes.cpu.pc - 1, nes.cpu.predecode, nes.cpu.status, nes.cpu.acc, nes.cpu.x, nes.cpu.y, nes.cpu.sp, nes.ppu.pos, nes.cpu.cyc);
         
-        if nes.cpu.proc.done {
+        if nes.cpu.proc.done && !nes.cpu.nmi {
+            nes.cpu.proc = InstructionProcedure::new(nmi, AddrMode::Implied);
+            nes.cpu.nmi = true; // disable NMI trigger signal (NMI is active-low)
+        } else if nes.cpu.proc.done {
             Cpu::fetch(nes);
             
             nes.cpu.proc = match nes.cpu.predecode {
@@ -453,8 +460,8 @@ impl Cpu {
             #[cfg(test)]
             {
                 nes.cpu.last_state = Some(TestState::from_nes(nes.clone()));
-                trace!("         PC: {:04X}, Op: {:02X}, Status: {}, ACC: {:02X}, X: {:02X}, Y: {:02X}, SP: {:02X}, PPU: {}, CYC: {}", nes.cpu.pc - 1, nes.cpu.predecode, nes.cpu.status, nes.cpu.acc, nes.cpu.x, nes.cpu.y, nes.cpu.sp, nes.ppu.pos, nes.cpu.cyc);
             }
+            log::trace!("PC: {:04X}, Op: {:02X}, Status: {}, ACC: {:02X}, X: {:02X}, Y: {:02X}, SP: {:02X}, PPU: {}, CYC: {}", nes.cpu.pc - 1, nes.cpu.predecode, nes.cpu.status, nes.cpu.acc, nes.cpu.x, nes.cpu.y, nes.cpu.sp, nes.ppu.pos, nes.cpu.cyc);
             
             nes.cpu.proc.cycle = 2; // the decode above costs 1 cycle
         } else {
@@ -486,6 +493,10 @@ impl CpuBusAccessible for Cpu {
     fn write(&mut self, addr: u16, data: u8) {
         match addr {
             0x0000..=0x1FFF => self.wram[(addr & 0x07FF) as usize] = data,
+            0x4014 => {
+                self.rdy = false;
+                self.dma_upper = data;
+            }
             _ => panic!("Write attempt to invalid address {:#06X} ({:#04X})", addr, data),
         }
     }
@@ -602,16 +613,27 @@ fn bpl(nes: &mut Nes) {
 }
 fn brk(nes: &mut Nes) {
     match nes.cpu.proc.cycle {
-        2 => { Cpu::fetch(nes); }, // TODO: do NOT increment on hardware interrupts
+        2 => { Cpu::fetch(nes); },
         3 => Cpu::stack_push(nes, (nes.cpu.pc >> 8) as u8),
-        4 => Cpu::stack_push(nes, nes.cpu.pc as u8),
+        4 => {
+            Cpu::stack_push(nes, nes.cpu.pc as u8);
+            
+            if !nes.cpu.nmi { //TODO: Add IRQ support here (check 6502_cpu.txt for details)
+                nes.cpu.proc.tmp_addr = 0xFFFA;
+                nes.cpu.nmi = true;
+            } else {
+                nes.cpu.proc.tmp_addr = 0xFFFE;
+            }
+        },
         5 => Cpu::stack_push(nes, nes.cpu.status.bits | 0b00010000),
-        6 => nes.cpu.proc.tmp0 = nes.read(0xFFFE),
+        6 => nes.cpu.proc.tmp0 = nes.read(nes.cpu.proc.tmp_addr),
         7 => {
-            nes.cpu.proc.tmp1 = nes.read(0xFFFF);
+            nes.cpu.proc.tmp1 = nes.read(nes.cpu.proc.tmp_addr + 1);
             
             nes.cpu.pc = ((nes.cpu.proc.tmp1 as u16) << 8) | (nes.cpu.proc.tmp0 as u16);
-            nes.cpu.status.set(StatusReg::InterruptDisable, true); // masswerk has conflicting statements, and 6502_cpu.txt says the I flag should be set here
+            if nes.cpu.proc.tmp_addr == 0xFFFE { // if uninterrupted BRK, then set I flag
+                nes.cpu.status.set(StatusReg::InterruptDisable, true); // masswerk has conflicting statements, and 6502_cpu.txt says the I flag should be set here
+            }
             
             nes.cpu.proc.done = true;
         }
@@ -993,6 +1015,23 @@ fn nop(nes: &mut Nes) {
     } else if let Some(addr) = effective_addr(nes) {
         nes.read(addr);
         nes.cpu.proc.done = true;
+    }
+}
+fn nmi(nes: &mut Nes) {
+    match nes.cpu.proc.cycle {
+        2 => { nes.read(nes.cpu.pc); },
+        3 => Cpu::stack_push(nes, (nes.cpu.pc >> 8) as u8),
+        4 => Cpu::stack_push(nes, nes.cpu.pc as u8),
+        5 => Cpu::stack_push(nes, nes.cpu.status.bits | 0b00000000),
+        6 => nes.cpu.proc.tmp0 = nes.read(0xFFFA),
+        7 => {
+            nes.cpu.proc.tmp1 = nes.read(0xFFFB);
+            
+            nes.cpu.pc = ((nes.cpu.proc.tmp1 as u16) << 8) | (nes.cpu.proc.tmp0 as u16);
+            
+            nes.cpu.proc.done = true;
+        }
+        _ => ()
     }
 }
 fn ora(nes: &mut Nes) {
@@ -1498,9 +1537,9 @@ fn effective_addr(nes: &mut Nes) -> Option<u16> {
                 }
                 4 => {
                     if nes.cpu.proc.mode == ZeroX {
-                        Some(((nes.cpu.proc.tmp0 as u16) + (nes.cpu.x as u16)) & 0x00FF) // TODO: Change to `(nes.cpu.proc.tmp0 + nes.cpu.x) as u16`
+                        Some(((nes.cpu.proc.tmp0 as u16) + (nes.cpu.x as u16)) & 0x00FF)
                     } else {
-                        Some(((nes.cpu.proc.tmp0 as u16) + (nes.cpu.y as u16)) & 0x00FF) // TODO: Change to `(nes.cpu.proc.tmp0 + nes.cpu.y) as u16`
+                        Some(((nes.cpu.proc.tmp0 as u16) + (nes.cpu.y as u16)) & 0x00FF)
                     }
                 }
                 _ => None

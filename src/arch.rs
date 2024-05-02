@@ -1,4 +1,3 @@
-use log::trace;
 use crate::arch::cartridge::Cartridge;
 use crate::arch::cpu::Cpu;
 use crate::arch::mappers::RomFile;
@@ -33,7 +32,6 @@ pub struct Nes {
     pub ppu: Ppu,
     pub cart: Cartridge,
     
-    #[cfg(feature = "tomharte")]
     pub last_bus: (u16, u8, bool), // addr, data, is_read
 }
 impl Nes {
@@ -65,18 +63,20 @@ impl CpuBusAccessible for Nes {
         }
         match addr {
             0x0000..=0x1FFF | 0x4014 => self.cpu.write(addr, data),
-            0x2000..=0x3FFF => self.ppu.write(addr, data),
+            0x2000..=0x3FFF => Ppu::port_write(self, addr, data),
             0x4000..=0x4017 => (),
             0x4018..=0x401F => panic!("Write attempt to CPU Test Mode at address {:#06X} ({:#04X})", addr, data),
             0x4020..=0xFFFF => self.cart.write_cpu(addr, data),
             //_ => panic!("Write attempt to invalid address {:#06X} ({:#04X})", addr, data),
         }
+        
+        self.last_bus = (addr, data, false);
     }
 
     fn read(&mut self, addr: u16) -> u8 {
         let val = match addr {
             0x0000..=0x1FFF => self.cpu.read(addr),
-            0x2000..=0x3FFF => self.ppu.read(addr),
+            0x2000..=0x3FFF => Ppu::port_read(self, addr),
             0x4000..=0x4017 => 0,
             0x4018..=0x401F => panic!("Read attempt to CPU Test Mode at address {:#06X}", addr),
             0x4020..=0xFFFF => self.cart.read_cpu(addr),
@@ -90,6 +90,8 @@ impl CpuBusAccessible for Nes {
         }
         
         self.cpu.predecode = val;
+        
+        self.last_bus = (addr, val, true);
         
         val
     }

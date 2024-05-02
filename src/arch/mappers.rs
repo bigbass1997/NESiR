@@ -24,6 +24,9 @@ pub trait Mapper: DynClone + Debug {
     
     /// Write access on CHR bus.
     fn write_ppu(&mut self, addr: u16, data: u8) {}
+    
+    //fn ciram_a10(&self) -> bool {}
+    //fn ciram__ce(&self) -> bool {}
 }
 dyn_clone::clone_trait_object!(Mapper);
 
