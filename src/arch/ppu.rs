@@ -7,12 +7,13 @@ use crate::arch::{Nes, ClockDivider};
 pub struct PixelPos {
     pub cycle: u16,
     pub scanline: u16,
-    //TODO: Implement even/odd frame dynamics
+    pub is_odd: bool,
 }
 impl Default for PixelPos {
     fn default() -> Self { Self {
         cycle: 0,
-        scanline: 261
+        scanline: 261,
+        is_odd: true, //TODO: Check what the initial state should be
     }}
 }
 impl Display for PixelPos {
@@ -29,6 +30,11 @@ impl PixelPos {
             
             if self.scanline == 262 {
                 self.scanline = 0;
+                self.is_odd = !self.is_odd;
+                
+                if self.is_odd {
+                    self.cycle = 1;
+                }
             }
         }
     }
@@ -81,6 +87,32 @@ impl VramAddr {
         self.0 = data & 0x73FF;
         nametable.set_base_nametable_addr(((data & 0x0C00) >> 10) as u8);
     }
+    
+    pub fn increment_coarse_x(&mut self) {
+        if self.coarse_x() == 31 {
+            self.set_coarse_x(0);
+            self.0 ^= 0x0400;
+        } else {
+            self.0 += 1;
+        }
+    }
+    
+    pub fn increment_fine_y(&mut self) {
+        if self.fine_y() == 7 {
+            self.set_fine_y(0);
+            
+            if self.coarse_y() == 29 {
+                self.set_coarse_y(0);
+                self.0 ^= 0x0800;
+            } else if self.coarse_y() == 31 {
+                self.set_coarse_y(0);
+            } else {
+                self.set_coarse_y(self.coarse_y() + 1);
+            }
+        } else {
+            self.set_fine_y(self.fine_y() + 1);
+        }
+    }
 }
 
 
@@ -94,10 +126,20 @@ pub struct Ppu {
     mask: MaskReg,
     oam_addr: u8,
     fine_x_scroll: u8,
+    /// The `v` register
     vram_addr: VramAddr,
+    /// The `t` register
     tmp_vram_addr: VramAddr,
-    ppuaddr: u16,
-    ppudata: u8,
+    
+    internal_bus_addr: u16,
+    nametable_lat: u8,
+    attribute_lat: u8,
+    pattern_lower_lat: u8,
+    pattern_upper_lat: u8,
+    
+    shift_attrib: u8,
+    shift_lower: u16,
+    shift_upper: u16,
     
     clock_divider: ClockDivider<4>,
     
@@ -126,8 +168,16 @@ impl Default for Ppu {
         fine_x_scroll: 0,
         vram_addr: VramAddr(0),
         tmp_vram_addr: VramAddr(0),
-        ppuaddr: 0,
-        ppudata: 0,
+        
+        internal_bus_addr: 0,
+        nametable_lat: 0,
+        attribute_lat: 0,
+        pattern_lower_lat: 0,
+        pattern_upper_lat: 0,
+        
+        shift_attrib: 0,
+        shift_lower: 0, //TODO: Check the initial state; maybe it's 0xFFFF?
+        shift_upper: 0, //TODO: Check the initial state; maybe it's 0xFFFF?
         
         clock_divider: ClockDivider::new(0), //todo: randomize
         
@@ -151,22 +201,109 @@ impl Ppu {
     }
     
     pub fn cycle(nes: &mut Nes) {
-        match nes.ppu.pos.cycle {
-            1 if nes.ppu.pos.scanline == 241 => {
+        let cycle = nes.ppu.pos.cycle;
+        let line = nes.ppu.pos.scanline;
+        match line {
+            0..=239 | 261 => {
+                if line == 261 && cycle == 1 {
+                    nes.ppu.vblank = false;
+                    //TODO: clear sprite overflow and sprite 0 hit bits
+                }
+                if line == 261 && (280..=304).contains(&cycle) && (nes.ppu.mask.show_background() || nes.ppu.mask.show_sprites()) {
+                    nes.ppu.vram_addr.0 = (nes.ppu.vram_addr.0 & !0x7BE0) | (nes.ppu.tmp_vram_addr.0 & !0x7BE0);
+                }
+                
+                if nes.ppu.mask.show_background() || nes.ppu.mask.show_sprites() {
+                    if (1..=256).contains(&cycle) {
+                        match cycle % 8 {
+                            1 => nes.ppu.internal_bus_addr = 0x2000 | (nes.ppu.vram_addr.0 & 0x0FFF),
+                            2 => nes.ppu.nametable_lat = Ppu::read(nes, nes.ppu.internal_bus_addr),
+                            
+                            3 => nes.ppu.internal_bus_addr = 0x23C0 | (nes.ppu.vram_addr.0 & 0x0C00) | ((nes.ppu.vram_addr.0 >> 4) & 0x38) | ((nes.ppu.vram_addr.0 >> 2) & 0x07),
+                            4 => nes.ppu.attribute_lat = Ppu::read(nes, nes.ppu.internal_bus_addr),
+                            
+                            5 => nes.ppu.internal_bus_addr = ((nes.ppu.ctrl.background_pattern_addr() as u16) << 12) | ((nes.ppu.nametable_lat as u16) << 4) | (nes.ppu.vram_addr.fine_y() as u16),
+                            6 => nes.ppu.pattern_lower_lat = Ppu::read(nes, nes.ppu.internal_bus_addr),
+                            
+                            7 => nes.ppu.internal_bus_addr = ((nes.ppu.ctrl.background_pattern_addr() as u16) << 12) | ((nes.ppu.nametable_lat as u16) << 4) | 0b1000 | (nes.ppu.vram_addr.fine_y() as u16),
+                            0 => {
+                                nes.ppu.pattern_upper_lat = Ppu::read(nes, nes.ppu.internal_bus_addr);
+                                
+                                nes.ppu.vram_addr.increment_coarse_x();
+                                
+                                if cycle != 1 {
+                                    nes.ppu.shift_attrib = nes.ppu.attribute_lat;
+                                    nes.ppu.shift_lower = (nes.ppu.shift_lower & 0xFF00) | (nes.ppu.pattern_lower_lat as u16);
+                                    nes.ppu.shift_upper = (nes.ppu.shift_upper & 0xFF00) | (nes.ppu.pattern_upper_lat as u16);
+                                }
+                            },
+                            
+                            _ => unreachable!()
+                        }
+                        
+                        if cycle == 256 {
+                            nes.ppu.vram_addr.increment_fine_y();
+                        } else if cycle == 257 {
+                            nes.ppu.vram_addr.0 = (nes.ppu.vram_addr.0 & !0x041F) | (nes.ppu.tmp_vram_addr.0 & !0x041F);
+                        }
+                    } else if (321..=340).contains(&cycle) {
+                        //TODO
+                    } else if cycle == 0 {
+                        nes.ppu.internal_bus_addr = ((nes.ppu.ctrl.background_pattern_addr() as u16) << 12) | ((nes.ppu.nametable_lat as u16) << 4) | (nes.ppu.vram_addr.fine_y() as u16);
+                        //TODO: Determine what more needs to be done here, if anything
+                    }
+                }
+                
+                if (2..=337).contains(&cycle) {
+                    nes.ppu.shift_lower <<= 1;
+                    nes.ppu.shift_lower |= 1;
+                    
+                    nes.ppu.shift_upper <<= 1;
+                    nes.ppu.shift_upper |= 1;
+                }
+            },
+            241 if cycle == 1 => {
                 nes.ppu.vblank = true;
                 Ppu::update_nmi_output(nes);
-            },
-            1 if nes.ppu.pos.scanline == 261 => {
-                nes.ppu.vblank = false;
-                //TODO: clear sprite overflow and sprite 0 hit bits
             },
             _ => ()
         }
         
+        if nes.ppu.mask.show_background() || nes.ppu.mask.show_sprites() {
+            nes.ppu.draw_pixel();
+        }
+        
         nes.ppu.pos.inc();
         nes.ppu.cycles_since_pwrrst += 1;
-        if !nes.ppu.ctrl_unlocked && nes.ppu.cycles_since_pwrrst >= 30000 {
+        if !nes.ppu.ctrl_unlocked && nes.ppu.cycles_since_pwrrst >= 30000 { //TODO: Confirm the precise number of cycles here
             nes.ppu.ctrl_unlocked = true;
+        }
+    }
+    
+    //Taken from https://github.com/sarchar/RetroDisassemblerStudio/blob/0508182f1ae0ef26477b3b918c41bdd39db52133/src/systems/nes/ppu.cpp#L734
+    fn draw_pixel(&mut self) {
+        let bit_lower = ((self.shift_lower >> (15 - (self.fine_x_scroll as u16))) & 1) as u8;
+        let bit_upper = ((self.shift_upper >> (15 - (self.fine_x_scroll as u16))) & 1) as u8;
+        
+        //TODO: Figure out what is actually happening below
+        
+        let x_pos = ((self.vram_addr.coarse_x() << 3) | self.fine_x_scroll) + (self.pos.cycle as u8 & 0x07);
+        let attr_x = (x_pos - 17) & 0x1F;
+        
+        let actual_attrib = if (((self.pos.cycle - 1) & 0x07) + self.fine_x_scroll as u16) >= 8 { self.attribute_lat } else { self.shift_attrib };
+        
+        let y_pos = (self.vram_addr.coarse_y() << 3) | self.vram_addr.fine_y();
+        let y_shift = (y_pos & 0x10) >> 2;
+        
+        let x_shift = (attr_x & 0x10) >> 3;
+        let attr = (actual_attrib >> (y_shift + x_shift)) & 0x03;
+        let pal_index = (attr << 2) | (bit_upper << 1) | bit_lower;
+        
+        //TODO: Add sprite selection
+        
+        let color = self.pal_values[pal_index as usize];
+        if let Some(pixel) = self.fb.get_mut((self.pos.scanline as usize * 256) + self.pos.cycle as usize) {
+            *pixel = color;
         }
     }
     
@@ -178,7 +315,7 @@ impl Ppu {
     
     /// Read from PPU memory map (may read into the cartridge)
     fn read(nes: &mut Nes, addr: u16) -> u8 {
-        match addr {
+        match addr & 0x3FFF { // address bus is only 14 bits wide
             0x0000..=0x1FFF => nes.cart.read_ppu(addr),
             0x2000..=0x3EFF => {
                 nes.ppu.ciram[(addr & 0x7FF) as usize] //TODO: Implement nametable mirroring
@@ -201,9 +338,9 @@ impl Ppu {
         }
     }
     
-    /// Read to PPU memory map (may write into the cartridge)
+    /// Write to PPU memory map (may write into the cartridge)
     fn write(nes: &mut Nes, addr: u16, data: u8) {
-        match addr {
+        match addr & 0x3FFF { // address bus is only 14 bits wide
             0x0000..=0x1FFF => {
                 nes.cart.write_ppu(addr, data);
                 
