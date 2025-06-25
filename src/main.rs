@@ -1,14 +1,13 @@
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::time::{Duration, Instant};
-use log::{LevelFilter, trace};
+use std::time::Duration;
 use clap::Parser;
 use minifb::{Key, Scale, ScaleMode, Window, WindowOptions};
+use tracing_subscriber::filter::LevelFilter;
 use crate::arch::mappers::RomFile;
 use crate::arch::{CpuBusAccessible, Nes};
 
 pub mod arch;
-pub mod logger;
 
 #[derive(Clone, Copy, Debug)]
 enum ScaleArg {
@@ -73,11 +72,13 @@ struct Args {
 fn main() {
     let args = Args::parse();
     
-    // Setup program-wide logger format
     {
-        let mut logbuilder = logger::builder();
-        logbuilder.filter_level(args.verbose.unwrap_or(LevelFilter::Debug));
-        logbuilder.init();
+        let builder = tracing_subscriber::fmt().with_env_filter("info,nesir=info");
+        if let Some(level) = args.verbose {
+            builder.with_max_level(level).init();
+        } else {
+            builder.init();
+        }
     }
     
     let mut window = Window::new(
@@ -172,7 +173,7 @@ fn main() {
     
     while window.is_open() && pattern_window.is_open() && nametable_window.is_open() && palette_window.is_open()
         && !window.is_key_down(Key::Escape) && !pattern_window.is_key_down(Key::Escape) && !nametable_window.is_key_down(Key::Escape) && !palette_window.is_key_down(Key::Escape) {
-        let start = Instant::now();
+        //let start = Instant::now();
         
         //for _ in 0..21477272 {
         for _ in 0..357654 {
@@ -183,7 +184,7 @@ fn main() {
         
         
         
-        let elapsed = start.elapsed();
+        //let elapsed = start.elapsed();
         window.update_with_buffer(fb, 256, 240).unwrap();
         
         render_pattern_table(&mut nes, &mut pattern_fb);
@@ -287,7 +288,7 @@ impl TestState {
             pc: nes.cpu.pc - 1,
             opcode: nes.read(nes.cpu.pc - 1),
             sp: nes.cpu.sp.0,
-            status: nes.cpu.status.bits(),
+            status: nes.cpu.status.0,
             acc: nes.cpu.acc,
             x: nes.cpu.x,
             y: nes.cpu.y,
@@ -391,7 +392,7 @@ mod tests {
         nes.cpu.predecode = nes.read(nes.cpu.pc);
         nes.cpu.cyc = 7;
         nes.ppu.pos = crate::arch::ppu::PixelPos { cycle: 19, scanline: 0 };
-        nes.cpu.status = StatusReg::from_bits_truncate(0x24);
+        nes.cpu.status.0 = 0x24;
         
         loop {
             Cpu::tick(&mut nes);
@@ -421,9 +422,9 @@ mod cputests {
     use std::error::Error;
     use std::fs::File;
     use std::num::Wrapping;
-    use log::trace;
+    use tracing::trace;
     use serde::{Deserialize, Serialize};
-    use crate::arch::cpu::{Cpu, StatusReg};
+    use crate::arch::cpu::Cpu;
     use crate::arch::Nes;
     
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -451,7 +452,7 @@ mod cputests {
                 a: cpu.acc,
                 x: cpu.x,
                 y: cpu.y,
-                p: cpu.status.bits(),
+                p: cpu.status.0,
                 ram,
             }
         }
@@ -463,7 +464,7 @@ mod cputests {
             if self.a != other.acc { return false; }
             if self.x != other.x { return false; }
             if self.y != other.y { return false; }
-            if self.p != other.status.bits() { return false; }
+            if self.p != other.status.0 { return false; }
             
             for (addr, data) in other.wram.into_iter().enumerate() {
                 match self.ram.iter().find(|(s_addr, _)| *s_addr as usize == addr) {
@@ -502,6 +503,7 @@ mod cputests {
     #[test]
     #[cfg(feature = "tomharte")]
     fn tomharte() -> Result<(), Box<dyn Error>> {
+        tracing_subscriber::fmt().with_env_filter("info,nesir=info").init();
         let mut handles = Vec::with_capacity(256);
         for entry in walkdir::WalkDir::new("tomharte")
             .sort_by_file_name()
@@ -510,7 +512,7 @@ mod cputests {
             .filter(|e| e.file_type().is_file())
             .filter(|e| {
                 let opcode = u8::from_str_radix(&e.path().file_stem().unwrap().to_string_lossy(), 16).unwrap();
-                //if opcode != 0x00 { return false; }
+                //if opcode != 0xDE { return false; }
                 
                 ![
                     0x02, 0x12, 0x22, 0x32, 0x42, 0x52, 0x62, 0x72, 0x92, 0xB2, 0xd2, 0xF2, // jams
@@ -523,7 +525,8 @@ mod cputests {
             // TODO: Change to build.rs script to generate individual tests, letting cargo parallelize this automatically
             handles.push(std::thread::spawn(|| {
                 let tests: Vec<TestData> = simd_json::from_reader(File::open(entry.into_path()).unwrap()).unwrap();
-                for test in tests {
+                let total = tests.len();
+                for (i, test) in tests.into_iter().enumerate() {
                     trace!("testing: {} ({})", test.name, test.cycles.len());
                     let mut nes = Nes::new();
                     
@@ -532,7 +535,7 @@ mod cputests {
                     nes.cpu.acc = test.initial.a;
                     nes.cpu.x = test.initial.x;
                     nes.cpu.y = test.initial.y;
-                    nes.cpu.status = StatusReg::from_bits_truncate(test.initial.p);
+                    nes.cpu.status.0 = test.initial.p;
                     for (addr, data) in &test.initial.ram {
                         nes.cpu.wram[*addr as usize] = *data;
                     }
@@ -559,6 +562,10 @@ mod cputests {
                     }
                     
                     assert!(test.final_ == nes.cpu, " left: {:X?}\nright: {:X?}", test.final_, State::from(&nes.cpu));
+                    
+                    if i % 100 == 0 {
+                        tracing::debug!("completed: {i}/{total}");
+                    }
                 }
             }));
         }

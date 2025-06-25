@@ -3,45 +3,40 @@
 
 use std::fmt::{Debug, Formatter};
 use std::num::Wrapping;
+use proc_bitfield::bitfield;
+use tracing::trace;
 use crate::arch::{Nes, CpuBusAccessible, ClockDivider};
-use bitflags::bitflags;
 use AddrMode::*;
 use crate::TestState;
 
 
-bitflags! {
-    pub struct StatusReg: u8 {
-        const Negative          = 0b10000000;
-        const Overflow          = 0b01000000;
-        const Unused            = 0b00100000;
-        const Break             = 0b00010000;
-        const Decimal           = 0b00001000;
-        const InterruptDisable  = 0b00000100;
-        const Zero              = 0b00000010;
-        const Carry             = 0b00000001;
-    }
-}
-impl Default for StatusReg {
-    fn default() -> Self {
-        StatusReg::Unused | StatusReg::Break | StatusReg::InterruptDisable
+bitfield! {
+    #[derive(Default, Clone, Copy, PartialEq, Eq)]
+    pub struct StatusReg(pub u8): Debug, FromStorage, IntoStorage, DerefStorage {
+        pub negative: bool @ 7,
+        pub overflow: bool @ 6,
+        
+        pub _break: bool @ 4,
+        pub decimal: bool @ 3,
+        pub interrupt_disable: bool @ 2,
+        pub zero: bool @ 1,
+        pub carry: bool @ 0,
     }
 }
 impl std::fmt::Display for StatusReg {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        let mut s = String::new();
-        if self.intersects(StatusReg::Negative)           { s.push('N') } else { s.push('n') }
-        if self.intersects(StatusReg::Overflow)           { s.push('V') } else { s.push('v') }
-        s.push('-');
-        if self.intersects(StatusReg::Break)              { s.push('B') } else { s.push('b') }
-        if self.intersects(StatusReg::Decimal)            { s.push('D') } else { s.push('d') }
-        if self.intersects(StatusReg::InterruptDisable)   { s.push('I') } else { s.push('i') }
-        if self.intersects(StatusReg::Zero)               { s.push('Z') } else { s.push('z') }
-        if self.intersects(StatusReg::Carry)              { s.push('C') } else { s.push('c') }
+        let n = if self.negative() { 'N' } else { 'n' };
+        let v = if self.overflow() { 'V' } else { 'v' };
         
-        write!(f, "{}", s)
+        let b = if self._break() { 'B' } else { 'b' };
+        let d = if self.decimal() { 'D' } else { 'd' };
+        let i = if self.interrupt_disable() { 'I' } else { 'i' };
+        let z = if self.zero() { 'Z' } else { 'z' };
+        let c = if self.carry() { 'C' } else { 'c' };
+        
+        write!(f, "{n}{v}-{b}{d}{i}{z}{c}")
     }
 }
-
 
 
 #[derive(Copy, Clone, Debug, PartialEq)]
@@ -461,7 +456,7 @@ impl Cpu {
             {
                 nes.cpu.last_state = Some(TestState::from_nes(nes.clone()));
             }
-            log::trace!("PC: {:04X}, Op: {:02X}, Status: {}, ACC: {:02X}, X: {:02X}, Y: {:02X}, SP: {:02X}, PPU: {}, CYC: {}", nes.cpu.pc - 1, nes.cpu.predecode, nes.cpu.status, nes.cpu.acc, nes.cpu.x, nes.cpu.y, nes.cpu.sp, nes.ppu.pos, nes.cpu.cyc);
+            trace!("PC: {:04X}, Op: {:02X}, Status: {}, ACC: {:02X}, X: {:02X}, Y: {:02X}, SP: {:02X}, PPU: {}, CYC: {}", nes.cpu.pc - 1, nes.cpu.predecode, nes.cpu.status, nes.cpu.acc, nes.cpu.x, nes.cpu.y, nes.cpu.sp, nes.ppu.pos, nes.cpu.cyc);
             
             nes.cpu.proc.cycle = 2; // the decode above costs 1 cycle
         } else {
@@ -526,13 +521,14 @@ fn adc(nes: &mut Nes) {
     if let Some(addr) = effective_addr(nes) {
         let data = nes.read(addr);
         
-        let result = (nes.cpu.acc as u16).wrapping_add(data as u16).wrapping_add(nes.cpu.status.contains(StatusReg::Carry) as u16);
+        let result = nes.cpu.acc as u16 + data as u16 + nes.cpu.status.carry() as u16;
+        let (result, carry) = (result as u8, result & 0x100 != 0);
         
-        nes.cpu.status.set(StatusReg::Carry, result & 0x100 != 0);
-        nes.cpu.status.set(StatusReg::Overflow, (!(nes.cpu.acc ^ data) & (nes.cpu.acc ^ result as u8) & 0x80) != 0);
-        nes.cpu.status.set(StatusReg::Zero, (result as u8) == 0);
-        nes.cpu.status.set(StatusReg::Negative, result & 0x80 > 0);
-        nes.cpu.acc = result as u8;
+        nes.cpu.status.set_carry(carry);
+        nes.cpu.status.set_overflow((!(nes.cpu.acc ^ data) & (nes.cpu.acc ^ result as u8) & 0x80) != 0);
+        nes.cpu.status.set_zero(result == 0);
+        nes.cpu.status.set_negative(result & 0x80 != 0);
+        nes.cpu.acc = result;
         
         nes.cpu.proc.done = true;
     }
@@ -542,8 +538,8 @@ fn and(nes: &mut Nes) {
     if let Some(addr) = effective_addr(nes) {
         nes.cpu.acc &= nes.read(addr);
         
-        nes.cpu.status.set(StatusReg::Zero, nes.cpu.acc == 0);
-        nes.cpu.status.set(StatusReg::Negative, nes.cpu.acc & 0x80 > 0);
+        nes.cpu.status.set_zero(nes.cpu.acc == 0);
+        nes.cpu.status.set_negative(nes.cpu.acc & 0x80 != 0);
         
         nes.cpu.proc.done = true;
     }
@@ -555,11 +551,11 @@ fn asl(nes: &mut Nes) {
         Accumulator => {
             match nes.cpu.proc.cycle {
                 2 => {
-                    nes.cpu.status.set(StatusReg::Carry, nes.cpu.acc & 0x80 != 0);
+                    nes.cpu.status.set_carry(nes.cpu.acc & 0x80 != 0);
                     nes.cpu.acc <<= 1;
                     
-                    nes.cpu.status.set(StatusReg::Zero, nes.cpu.acc == 0);
-                    nes.cpu.status.set(StatusReg::Negative, nes.cpu.acc & 0x80 > 0);
+                    nes.cpu.status.set_zero(nes.cpu.acc == 0);
+                    nes.cpu.status.set_negative(nes.cpu.acc & 0x80 != 0);
                     
                     nes.read(nes.cpu.pc);
                     nes.cpu.proc.done = true;
@@ -569,11 +565,11 @@ fn asl(nes: &mut Nes) {
         },
         _ => {
             if let Some(addr) = read_modify_write(nes) {
-                nes.cpu.status.set(StatusReg::Carry, nes.cpu.proc.tmp0 & 0x80 != 0);
+                nes.cpu.status.set_carry(nes.cpu.acc & 0x80 != 0);
                 nes.cpu.proc.tmp0 <<= 1;
                 
-                nes.cpu.status.set(StatusReg::Zero, nes.cpu.proc.tmp0 == 0);
-                nes.cpu.status.set(StatusReg::Negative, nes.cpu.proc.tmp0 & 0x80 > 0);
+                nes.cpu.status.set_zero(nes.cpu.acc == 0);
+                nes.cpu.status.set_negative(nes.cpu.acc & 0x80 != 0);
                 nes.write(addr, nes.cpu.proc.tmp0);
                 
                 nes.cpu.proc.done = true;
@@ -583,33 +579,33 @@ fn asl(nes: &mut Nes) {
 }
 fn asr(nes: &mut Nes) { unimplemented!() }
 fn bcc(nes: &mut Nes) {
-    branch(nes, !nes.cpu.status.contains(StatusReg::Carry));
+    branch(nes, !nes.cpu.status.carry());
 }
 fn bcs(nes: &mut Nes) {
-    branch(nes, nes.cpu.status.contains(StatusReg::Carry));
+    branch(nes, nes.cpu.status.carry());
 }
 fn beq(nes: &mut Nes) {
-    branch(nes, nes.cpu.status.contains(StatusReg::Zero));
+    branch(nes, nes.cpu.status.zero());
 }
 fn bit(nes: &mut Nes) {
     if let Some(addr) = effective_addr(nes) {
         let tmp = nes.read(addr);
         
-        nes.cpu.status.set(StatusReg::Zero, tmp & nes.cpu.acc == 0);
-        nes.cpu.status.set(StatusReg::Overflow, tmp & 0x40 > 0);
-        nes.cpu.status.set(StatusReg::Negative, tmp & 0x80 > 0);
+        nes.cpu.status.set_zero(tmp & nes.cpu.acc == 0);
+        nes.cpu.status.set_overflow(tmp & 0x40 != 0);
+        nes.cpu.status.set_negative(tmp & 0x80 != 0);
         
         nes.cpu.proc.done = true;
     }
 }
 fn bmi(nes: &mut Nes) {
-    branch(nes, nes.cpu.status.contains(StatusReg::Negative));
+    branch(nes, nes.cpu.status.negative());
 }
 fn bne(nes: &mut Nes) {
-    branch(nes, !nes.cpu.status.contains(StatusReg::Zero));
+    branch(nes, !nes.cpu.status.zero());
 }
 fn bpl(nes: &mut Nes) {
-    branch(nes, !nes.cpu.status.contains(StatusReg::Negative));
+    branch(nes, !nes.cpu.status.negative());
 }
 fn brk(nes: &mut Nes) {
     match nes.cpu.proc.cycle {
@@ -625,14 +621,14 @@ fn brk(nes: &mut Nes) {
                 nes.cpu.proc.tmp_addr = 0xFFFE;
             }
         },
-        5 => Cpu::stack_push(nes, nes.cpu.status.bits | 0b00010000),
+        5 => Cpu::stack_push(nes, nes.cpu.status.0 | 0b00010000),
         6 => nes.cpu.proc.tmp0 = nes.read(nes.cpu.proc.tmp_addr),
         7 => {
             nes.cpu.proc.tmp1 = nes.read(nes.cpu.proc.tmp_addr + 1);
             
             nes.cpu.pc = ((nes.cpu.proc.tmp1 as u16) << 8) | (nes.cpu.proc.tmp0 as u16);
             if nes.cpu.proc.tmp_addr == 0xFFFE { // if uninterrupted BRK, then set I flag
-                nes.cpu.status.set(StatusReg::InterruptDisable, true); // masswerk has conflicting statements, and 6502_cpu.txt says the I flag should be set here
+                nes.cpu.status.set_interrupt_disable(true); // masswerk has conflicting statements, and 6502_cpu.txt says the I flag should be set here
             }
             
             nes.cpu.proc.done = true;
@@ -641,10 +637,10 @@ fn brk(nes: &mut Nes) {
     }
 }
 fn bvc(nes: &mut Nes) {
-    branch(nes, !nes.cpu.status.contains(StatusReg::Overflow));
+    branch(nes, !nes.cpu.status.overflow());
 }
 fn bvs(nes: &mut Nes) {
-    branch(nes, nes.cpu.status.contains(StatusReg::Overflow));
+    branch(nes, nes.cpu.status.overflow());
 }
 
 fn branch(nes: &mut Nes, to_branch: bool) {
@@ -678,7 +674,7 @@ fn branch(nes: &mut Nes, to_branch: bool) {
 fn clc(nes: &mut Nes) {
     match nes.cpu.proc.cycle {
         2 => {
-            nes.cpu.status.set(StatusReg::Carry, false);
+            nes.cpu.status.set_carry(false);
             
             nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
@@ -689,7 +685,7 @@ fn clc(nes: &mut Nes) {
 fn cld(nes: &mut Nes) {
     match nes.cpu.proc.cycle {
         2 => {
-            nes.cpu.status.set(StatusReg::Decimal, false);
+            nes.cpu.status.set_decimal(false);
             
             nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
@@ -700,7 +696,7 @@ fn cld(nes: &mut Nes) {
 fn cli(nes: &mut Nes) {
     match nes.cpu.proc.cycle {
         2 => {
-            nes.cpu.status.set(StatusReg::InterruptDisable, false);
+            nes.cpu.status.set_interrupt_disable(false);
             
             nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
@@ -711,7 +707,7 @@ fn cli(nes: &mut Nes) {
 fn clv(nes: &mut Nes) {
     match nes.cpu.proc.cycle {
         2 => {
-            nes.cpu.status.set(StatusReg::Overflow, false);
+            nes.cpu.status.set_overflow(false);
             
             nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
@@ -723,9 +719,9 @@ fn cmp(nes: &mut Nes) {
     if let Some(addr) = effective_addr(nes) {
         let data = nes.read(addr);
         
-        nes.cpu.status.set(StatusReg::Carry, nes.cpu.acc >= data);
-        nes.cpu.status.set(StatusReg::Zero, nes.cpu.acc == data);
-        nes.cpu.status.set(StatusReg::Negative, nes.cpu.acc.wrapping_sub(data) & 0x80 > 0);
+        nes.cpu.status.set_carry(nes.cpu.acc >= data);
+        nes.cpu.status.set_zero(nes.cpu.acc == data);
+        nes.cpu.status.set_negative(nes.cpu.acc.wrapping_sub(data) & 0x80 != 0);
         
         nes.cpu.proc.done = true;
     }
@@ -734,9 +730,9 @@ fn cpx(nes: &mut Nes) {
     if let Some(addr) = effective_addr(nes) {
         let data = nes.read(addr);
         
-        nes.cpu.status.set(StatusReg::Carry, nes.cpu.x >= data);
-        nes.cpu.status.set(StatusReg::Zero, nes.cpu.x == data);
-        nes.cpu.status.set(StatusReg::Negative, nes.cpu.x.wrapping_sub(data) & 0x80 > 0);
+        nes.cpu.status.set_carry(nes.cpu.acc >= data);
+        nes.cpu.status.set_zero(nes.cpu.acc == data);
+        nes.cpu.status.set_negative(nes.cpu.acc.wrapping_sub(data) & 0x80 != 0);
         
         nes.cpu.proc.done = true;
     }
@@ -745,9 +741,9 @@ fn cpy(nes: &mut Nes) {
     if let Some(addr) = effective_addr(nes) {
         let data = nes.read(addr);
         
-        nes.cpu.status.set(StatusReg::Carry, nes.cpu.y >= data);
-        nes.cpu.status.set(StatusReg::Zero, nes.cpu.y == data);
-        nes.cpu.status.set(StatusReg::Negative, nes.cpu.y.wrapping_sub(data) & 0x80 > 0);
+        nes.cpu.status.set_carry(nes.cpu.acc >= data);
+        nes.cpu.status.set_zero(nes.cpu.acc == data);
+        nes.cpu.status.set_negative(nes.cpu.acc.wrapping_sub(data) & 0x80 != 0);
         
         nes.cpu.proc.done = true;
     }
@@ -756,9 +752,9 @@ fn dcp(nes: &mut Nes) {
     if let Some(addr) = read_modify_write(nes) {
         nes.cpu.proc.tmp0 = nes.cpu.proc.tmp0.wrapping_sub(1);
         
-        nes.cpu.status.set(StatusReg::Carry, nes.cpu.acc >= nes.cpu.proc.tmp0);
-        nes.cpu.status.set(StatusReg::Zero, nes.cpu.acc == nes.cpu.proc.tmp0);
-        nes.cpu.status.set(StatusReg::Negative, nes.cpu.acc.wrapping_sub(nes.cpu.proc.tmp0) & 0x80 > 0);
+        nes.cpu.status.set_carry(nes.cpu.acc >= nes.cpu.proc.tmp0);
+        nes.cpu.status.set_zero(nes.cpu.acc == nes.cpu.proc.tmp0);
+        nes.cpu.status.set_negative(nes.cpu.acc.wrapping_sub(nes.cpu.proc.tmp0) & 0x80 != 0);
         nes.write(addr, nes.cpu.proc.tmp0);
         
         nes.cpu.proc.done = true;
@@ -768,8 +764,8 @@ fn dec(nes: &mut Nes) {
     if let Some(addr) = read_modify_write(nes) {
         nes.cpu.proc.tmp0 = nes.cpu.proc.tmp0.wrapping_sub(1);
         
-        nes.cpu.status.set(StatusReg::Zero, nes.cpu.proc.tmp0 == 0);
-        nes.cpu.status.set(StatusReg::Negative, nes.cpu.proc.tmp0 & 0x80 > 0);
+        nes.cpu.status.set_zero(nes.cpu.proc.tmp0 == 0);
+        nes.cpu.status.set_negative(nes.cpu.proc.tmp0 & 0x80 != 0);
         nes.write(addr, nes.cpu.proc.tmp0);
         
         nes.cpu.proc.done = true;
@@ -779,8 +775,8 @@ fn dex(nes: &mut Nes) {
     match nes.cpu.proc.cycle {
         2 => {
             nes.cpu.x = nes.cpu.x.wrapping_sub(1);
-            nes.cpu.status.set(StatusReg::Zero, nes.cpu.x == 0);
-            nes.cpu.status.set(StatusReg::Negative, nes.cpu.x & 0x80 > 0);
+            nes.cpu.status.set_zero(nes.cpu.x == 0);
+            nes.cpu.status.set_negative(nes.cpu.x & 0x80 != 0);
             
             nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
@@ -792,8 +788,8 @@ fn dey(nes: &mut Nes) {
     match nes.cpu.proc.cycle {
         2 => {
             nes.cpu.y = nes.cpu.y.wrapping_sub(1);
-            nes.cpu.status.set(StatusReg::Zero, nes.cpu.y == 0);
-            nes.cpu.status.set(StatusReg::Negative, nes.cpu.y & 0x80 > 0);
+            nes.cpu.status.set_zero(nes.cpu.y == 0);
+            nes.cpu.status.set_negative(nes.cpu.y & 0x80 != 0);
             
             nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
@@ -805,8 +801,8 @@ fn eor(nes: &mut Nes) {
     if let Some(addr) = effective_addr(nes) {
         nes.cpu.acc ^= nes.read(addr);
         
-        nes.cpu.status.set(StatusReg::Zero, nes.cpu.acc == 0);
-        nes.cpu.status.set(StatusReg::Negative, nes.cpu.acc & 0x80 > 0);
+        nes.cpu.status.set_zero(nes.cpu.acc == 0);
+        nes.cpu.status.set_negative(nes.cpu.acc & 0x80 != 0);
         
         nes.cpu.proc.done = true;
     }
@@ -815,8 +811,8 @@ fn inc(nes: &mut Nes) {
     if let Some(addr) = read_modify_write(nes) {
         nes.cpu.proc.tmp0 = nes.cpu.proc.tmp0.wrapping_add(1);
         
-        nes.cpu.status.set(StatusReg::Zero, nes.cpu.proc.tmp0 == 0);
-        nes.cpu.status.set(StatusReg::Negative, nes.cpu.proc.tmp0 & 0x80 > 0);
+        nes.cpu.status.set_zero(nes.cpu.proc.tmp0 == 0);
+        nes.cpu.status.set_negative(nes.cpu.proc.tmp0 & 0x80 != 0);
         nes.write(addr, nes.cpu.proc.tmp0);
         
         nes.cpu.proc.done = true;
@@ -826,8 +822,8 @@ fn inx(nes: &mut Nes) {
     match nes.cpu.proc.cycle {
         2 => {
             nes.cpu.x = nes.cpu.x.wrapping_add(1);
-            nes.cpu.status.set(StatusReg::Zero, nes.cpu.x == 0);
-            nes.cpu.status.set(StatusReg::Negative, nes.cpu.x & 0x80 > 0);
+            nes.cpu.status.set_zero(nes.cpu.x == 0);
+            nes.cpu.status.set_negative(nes.cpu.x & 0x80 != 0);
             
             nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
@@ -839,8 +835,8 @@ fn iny(nes: &mut Nes) {
     match nes.cpu.proc.cycle {
         2 => {
             nes.cpu.y = nes.cpu.y.wrapping_add(1);
-            nes.cpu.status.set(StatusReg::Zero, nes.cpu.y == 0);
-            nes.cpu.status.set(StatusReg::Negative, nes.cpu.y & 0x80 > 0);
+            nes.cpu.status.set_zero(nes.cpu.y == 0);
+            nes.cpu.status.set_negative(nes.cpu.y & 0x80 != 0);
             
             nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
@@ -854,13 +850,14 @@ fn isb(nes: &mut Nes) {
         
         let data = !nes.cpu.proc.tmp0; //TODO: Check if we should use tmp0 POST-increment or PRE-increment
         
-        let result = (nes.cpu.acc as u16).wrapping_add(data as u16).wrapping_add(nes.cpu.status.contains(StatusReg::Carry) as u16);
+        let result = nes.cpu.acc as u16 + data as u16 + nes.cpu.status.carry() as u16;
+        let (result, carry) = (result as u8, result & 0x100 != 0);
         
-        nes.cpu.status.set(StatusReg::Carry, result & 0x100 != 0);
-        nes.cpu.status.set(StatusReg::Overflow, (!(nes.cpu.acc ^ data) & (nes.cpu.acc ^ result as u8) & 0x80) != 0);
-        nes.cpu.status.set(StatusReg::Zero, (result as u8) == 0);
-        nes.cpu.status.set(StatusReg::Negative, result & 0x80 > 0);
-        nes.cpu.acc = result as u8;
+        nes.cpu.status.set_carry(carry);
+        nes.cpu.status.set_overflow((!(nes.cpu.acc ^ data) & (nes.cpu.acc ^ result as u8) & 0x80) != 0);
+        nes.cpu.status.set_zero(result == 0);
+        nes.cpu.status.set_negative(result & 0x80 != 0);
+        nes.cpu.acc = result;
         
         nes.write(addr, nes.cpu.proc.tmp0);
         
@@ -905,9 +902,9 @@ fn jmp(nes: &mut Nes) {
 fn jsr(nes: &mut Nes) {
     match nes.cpu.proc.cycle {
         2 => nes.cpu.proc.tmp0 = Cpu::fetch(nes),
-        3 => {nes.read(0x100 + nes.cpu.sp.0 as u16);}, // discarded read, may be useful later for monitoring bus activity
+        3 => { nes.read(0x100 + nes.cpu.sp.0 as u16); },
         4 => Cpu::stack_push(nes, (nes.cpu.pc >> 8) as u8),
-        5 => Cpu::stack_push(nes, (nes.cpu.pc & 0xFF) as u8),
+        5 => Cpu::stack_push(nes, nes.cpu.pc as u8),
         6 => {
             nes.cpu.proc.tmp1 = Cpu::fetch(nes);
             
@@ -925,8 +922,8 @@ fn las(nes: &mut Nes) {
         nes.cpu.x = tmp;
         nes.cpu.sp.0 = tmp;
         
-        nes.cpu.status.set(StatusReg::Zero, tmp == 0);
-        nes.cpu.status.set(StatusReg::Negative, tmp & 0x80 > 0);
+        nes.cpu.status.set_zero(tmp == 0);
+        nes.cpu.status.set_negative(tmp & 0x80 != 0);
         
         nes.cpu.proc.done = true;
     }
@@ -937,8 +934,8 @@ fn lax(nes: &mut Nes) {
         nes.cpu.acc = tmp;
         nes.cpu.x = tmp;
         
-        nes.cpu.status.set(StatusReg::Zero, nes.cpu.x == 0);
-        nes.cpu.status.set(StatusReg::Negative, nes.cpu.x & 0x80 > 0);
+        nes.cpu.status.set_zero(tmp == 0);
+        nes.cpu.status.set_negative(tmp & 0x80 != 0);
         
         nes.cpu.proc.done = true;
     }
@@ -947,8 +944,8 @@ fn lda(nes: &mut Nes) {
     if let Some(addr) = effective_addr(nes) {
         nes.cpu.acc = nes.read(addr);
         
-        nes.cpu.status.set(StatusReg::Zero, nes.cpu.acc == 0);
-        nes.cpu.status.set(StatusReg::Negative, nes.cpu.acc & 0x80 > 0);
+        nes.cpu.status.set_zero(nes.cpu.acc == 0);
+        nes.cpu.status.set_negative(nes.cpu.acc & 0x80 != 0);
         
         nes.cpu.proc.done = true;
     }
@@ -957,8 +954,8 @@ fn ldx(nes: &mut Nes) {
     if let Some(addr) = effective_addr(nes) {
         nes.cpu.x = nes.read(addr);
         
-        nes.cpu.status.set(StatusReg::Zero, nes.cpu.x == 0);
-        nes.cpu.status.set(StatusReg::Negative, nes.cpu.x & 0x80 > 0);
+        nes.cpu.status.set_zero(nes.cpu.x == 0);
+        nes.cpu.status.set_negative(nes.cpu.x & 0x80 != 0);
         
         nes.cpu.proc.done = true;
     }
@@ -967,8 +964,8 @@ fn ldy(nes: &mut Nes) {
     if let Some(addr) = effective_addr(nes) {
         nes.cpu.y = nes.read(addr);
         
-        nes.cpu.status.set(StatusReg::Zero, nes.cpu.y == 0);
-        nes.cpu.status.set(StatusReg::Negative, nes.cpu.y & 0x80 > 0);
+        nes.cpu.status.set_zero(nes.cpu.y == 0);
+        nes.cpu.status.set_negative(nes.cpu.y & 0x80 != 0);
         
         nes.cpu.proc.done = true;
     }
@@ -978,11 +975,11 @@ fn lsr(nes: &mut Nes) {
         Accumulator => {
             match nes.cpu.proc.cycle {
                 2 => {
-                    nes.cpu.status.set(StatusReg::Carry, nes.cpu.acc & 0x01 != 0);
+                    nes.cpu.status.set_carry(nes.cpu.acc & 0x01 != 0);
                     nes.cpu.acc >>= 1;
                     
-                    nes.cpu.status.set(StatusReg::Zero, nes.cpu.acc == 0);
-                    nes.cpu.status.set(StatusReg::Negative, nes.cpu.acc & 0x80 > 0);
+                    nes.cpu.status.set_zero(nes.cpu.acc == 0);
+                    nes.cpu.status.set_negative(nes.cpu.acc & 0x80 != 0);
                     
                     nes.read(nes.cpu.pc);
                     nes.cpu.proc.done = true;
@@ -992,11 +989,11 @@ fn lsr(nes: &mut Nes) {
         },
         _ => {
             if let Some(addr) = read_modify_write(nes) {
-                nes.cpu.status.set(StatusReg::Carry, nes.cpu.proc.tmp0 & 0x01 != 0);
+                nes.cpu.status.set_carry(nes.cpu.proc.tmp0 & 0x01 != 0);
                 nes.cpu.proc.tmp0 >>= 1;
                 
-                nes.cpu.status.set(StatusReg::Zero, nes.cpu.proc.tmp0 == 0);
-                nes.cpu.status.set(StatusReg::Negative, nes.cpu.proc.tmp0 & 0x80 > 0);
+                nes.cpu.status.set_zero(nes.cpu.proc.tmp0 == 0);
+                nes.cpu.status.set_negative(nes.cpu.proc.tmp0 & 0x80 != 0);
                 nes.write(addr, nes.cpu.proc.tmp0);
                 
                 nes.cpu.proc.done = true;
@@ -1022,7 +1019,7 @@ fn nmi(nes: &mut Nes) {
         2 => { nes.read(nes.cpu.pc); },
         3 => Cpu::stack_push(nes, (nes.cpu.pc >> 8) as u8),
         4 => Cpu::stack_push(nes, nes.cpu.pc as u8),
-        5 => Cpu::stack_push(nes, nes.cpu.status.bits | 0b00000000),
+        5 => Cpu::stack_push(nes, nes.cpu.status.0),
         6 => nes.cpu.proc.tmp0 = nes.read(0xFFFA),
         7 => {
             nes.cpu.proc.tmp1 = nes.read(0xFFFB);
@@ -1038,8 +1035,8 @@ fn ora(nes: &mut Nes) {
     if let Some(addr) = effective_addr(nes) {
         nes.cpu.acc |= nes.read(addr);
         
-        nes.cpu.status.set(StatusReg::Zero, nes.cpu.acc == 0);
-        nes.cpu.status.set(StatusReg::Negative, nes.cpu.acc & 0x80 > 0);
+        nes.cpu.status.set_zero(nes.cpu.acc == 0);
+        nes.cpu.status.set_negative(nes.cpu.acc & 0x80 != 0);
         
         nes.cpu.proc.done = true;
     }
@@ -1059,7 +1056,7 @@ fn php(nes: &mut Nes) {
     match nes.cpu.proc.cycle {
         2 => { nes.read(nes.cpu.pc); },
         3 => {
-            Cpu::stack_push(nes, nes.cpu.status.bits | 0b00110000); //TODO: Verify bits [5:4] are supposed to be set by PHP
+            Cpu::stack_push(nes, nes.cpu.status.0 | 0b00110000); //TODO: Verify bits [5:4] are supposed to be set by PHP
             
             nes.cpu.proc.done = true;
         },
@@ -1073,8 +1070,8 @@ fn pla(nes: &mut Nes) {
         4 => {
             nes.cpu.acc = Cpu::stack_pull(nes);
             
-            nes.cpu.status.set(StatusReg::Zero, nes.cpu.acc == 0);
-            nes.cpu.status.set(StatusReg::Negative, nes.cpu.acc & 0x80 > 0);
+            nes.cpu.status.set_zero(nes.cpu.acc == 0);
+            nes.cpu.status.set_negative(nes.cpu.acc & 0x80 != 0);
             
             nes.cpu.proc.done = true;
         },
@@ -1086,8 +1083,8 @@ fn plp(nes: &mut Nes) {
         2 => { nes.read(nes.cpu.pc); },
         3 => { nes.read(nes.cpu.sp.0 as u16 + 0x100u16); }
         4 => {
-            nes.cpu.status.bits = Cpu::stack_pull(nes) & 0b11001111; //TODO: Verify bits [5:4] are supposed to be ignored by PLP
-            nes.cpu.status.bits |= 0b00100000; // Apparently, bit 5 should always be set
+            nes.cpu.status.0 = Cpu::stack_pull(nes) & 0b11001111; //TODO: Verify bits [5:4] are supposed to be ignored by PLP
+            nes.cpu.status.0 |= 0b00100000; // Apparently, bit 5 should always be set
             
             nes.cpu.proc.done = true;
         },
@@ -1096,14 +1093,14 @@ fn plp(nes: &mut Nes) {
 }
 fn rla(nes: &mut Nes) {
     if let Some(addr) = read_modify_write(nes) {
-        let c = nes.cpu.status.contains(StatusReg::Carry) as u8;
-        nes.cpu.status.set(StatusReg::Carry, nes.cpu.proc.tmp0 & 0x80 != 0);
+        let c = nes.cpu.status.carry() as u8;
+        nes.cpu.status.set_carry(nes.cpu.proc.tmp0 & 0x80 != 0);
         nes.cpu.proc.tmp0 = ((nes.cpu.proc.tmp0 << 1) & 0xFE) | c;
         
         nes.cpu.acc &= nes.cpu.proc.tmp0;
         
-        nes.cpu.status.set(StatusReg::Zero, nes.cpu.acc == 0);
-        nes.cpu.status.set(StatusReg::Negative, nes.cpu.acc & 0x80 > 0);
+        nes.cpu.status.set_zero(nes.cpu.acc == 0);
+        nes.cpu.status.set_negative(nes.cpu.acc & 0x80 != 0);
         nes.write(addr, nes.cpu.proc.tmp0);
         
         nes.cpu.proc.done = true;
@@ -1111,18 +1108,19 @@ fn rla(nes: &mut Nes) {
 }
 fn rra(nes: &mut Nes) {
     if let Some(addr) = read_modify_write(nes) {
-        let c = nes.cpu.status.contains(StatusReg::Carry) as u8;
-        nes.cpu.status.set(StatusReg::Carry, nes.cpu.proc.tmp0 & 0x01 != 0);
+        let c = nes.cpu.status.carry() as u8;
+        nes.cpu.status.set_carry(nes.cpu.proc.tmp0 & 0x01 != 0);
         nes.cpu.proc.tmp0 = (c << 7) | ((nes.cpu.proc.tmp0 >> 1) & 0x7F);
         let data = nes.cpu.proc.tmp0;
         
-        let result = (nes.cpu.acc as u16).wrapping_add(data as u16).wrapping_add(nes.cpu.status.contains(StatusReg::Carry) as u16);
+        let result = nes.cpu.acc as u16 + data as u16 + nes.cpu.status.carry() as u16;
+        let (result, carry) = (result as u8, result & 0x100 != 0);
         
-        nes.cpu.status.set(StatusReg::Carry, result & 0x100 != 0);
-        nes.cpu.status.set(StatusReg::Overflow, (!(nes.cpu.acc ^ data) & (nes.cpu.acc ^ result as u8) & 0x80) != 0);
-        nes.cpu.status.set(StatusReg::Zero, (result as u8) == 0);
-        nes.cpu.status.set(StatusReg::Negative, result & 0x80 > 0);
-        nes.cpu.acc = result as u8;
+        nes.cpu.status.set_carry(carry);
+        nes.cpu.status.set_overflow((!(nes.cpu.acc ^ data) & (nes.cpu.acc ^ result as u8) & 0x80) != 0);
+        nes.cpu.status.set_zero(result == 0);
+        nes.cpu.status.set_negative(result & 0x80 != 0);
+        nes.cpu.acc = result;
         nes.write(addr, nes.cpu.proc.tmp0);
         
         nes.cpu.proc.done = true;
@@ -1133,12 +1131,12 @@ fn rol(nes: &mut Nes) {
         Accumulator => {
             match nes.cpu.proc.cycle {
                 2 => {
-                    let c = nes.cpu.status.contains(StatusReg::Carry) as u8;
-                    nes.cpu.status.set(StatusReg::Carry, nes.cpu.acc & 0x80 != 0);
+                    let c = nes.cpu.status.carry() as u8;
+                    nes.cpu.status.set_carry(nes.cpu.acc & 0x80 != 0);
                     nes.cpu.acc = ((nes.cpu.acc << 1) & 0xFE) | c;
                     
-                    nes.cpu.status.set(StatusReg::Zero, nes.cpu.acc == 0);
-                    nes.cpu.status.set(StatusReg::Negative, nes.cpu.acc & 0x80 > 0);
+                    nes.cpu.status.set_zero(nes.cpu.acc == 0);
+                    nes.cpu.status.set_negative(nes.cpu.acc & 0x80 != 0);
                     
                     nes.read(nes.cpu.pc);
                     nes.cpu.proc.done = true;
@@ -1148,12 +1146,12 @@ fn rol(nes: &mut Nes) {
         },
         _ => {
             if let Some(addr) = read_modify_write(nes) {
-                let c = nes.cpu.status.contains(StatusReg::Carry) as u8;
-                nes.cpu.status.set(StatusReg::Carry, nes.cpu.proc.tmp0 & 0x80 != 0);
+                let c = nes.cpu.status.carry() as u8;
+                nes.cpu.status.set_carry(nes.cpu.acc & 0x80 != 0);
                 nes.cpu.proc.tmp0 = ((nes.cpu.proc.tmp0 << 1) & 0xFE) | c;
                 
-                nes.cpu.status.set(StatusReg::Zero, nes.cpu.proc.tmp0 == 0);
-                nes.cpu.status.set(StatusReg::Negative, nes.cpu.proc.tmp0 & 0x80 > 0);
+                nes.cpu.status.set_zero(nes.cpu.acc == 0);
+                nes.cpu.status.set_negative(nes.cpu.acc & 0x80 != 0);
                 nes.write(addr, nes.cpu.proc.tmp0);
                 
                 nes.cpu.proc.done = true;
@@ -1166,12 +1164,12 @@ fn ror(nes: &mut Nes) {
         Accumulator => {
             match nes.cpu.proc.cycle {
                 2 => {
-                    let c = nes.cpu.status.contains(StatusReg::Carry) as u8;
-                    nes.cpu.status.set(StatusReg::Carry, nes.cpu.acc & 0x01 != 0);
+                    let c = nes.cpu.status.carry() as u8;
+                    nes.cpu.status.set_carry(nes.cpu.acc & 0x01 != 0);
                     nes.cpu.acc = (c << 7) | ((nes.cpu.acc >> 1) & 0x7F);
                     
-                    nes.cpu.status.set(StatusReg::Zero, nes.cpu.acc == 0);
-                    nes.cpu.status.set(StatusReg::Negative, nes.cpu.acc & 0x80 > 0);
+                    nes.cpu.status.set_zero(nes.cpu.acc == 0);
+                    nes.cpu.status.set_negative(nes.cpu.acc & 0x80 != 0);
                     
                     nes.read(nes.cpu.pc);
                     nes.cpu.proc.done = true;
@@ -1181,12 +1179,12 @@ fn ror(nes: &mut Nes) {
         },
         _ => {
             if let Some(addr) = read_modify_write(nes) {
-                let c = nes.cpu.status.contains(StatusReg::Carry) as u8;
-                nes.cpu.status.set(StatusReg::Carry, nes.cpu.proc.tmp0 & 0x01 != 0);
+                let c = nes.cpu.status.carry() as u8;
+                nes.cpu.status.set_carry(nes.cpu.proc.tmp0 & 0x01 != 0);
                 nes.cpu.proc.tmp0 = (c << 7) | ((nes.cpu.proc.tmp0 >> 1) & 0x7F);
                 
-                nes.cpu.status.set(StatusReg::Zero, nes.cpu.proc.tmp0 == 0);
-                nes.cpu.status.set(StatusReg::Negative, nes.cpu.proc.tmp0 & 0x80 > 0);
+                nes.cpu.status.set_zero(nes.cpu.proc.tmp0 == 0);
+                nes.cpu.status.set_negative(nes.cpu.proc.tmp0 & 0x80 != 0);
                 nes.write(addr, nes.cpu.proc.tmp0);
                 
                 nes.cpu.proc.done = true;
@@ -1199,8 +1197,8 @@ fn rti(nes: &mut Nes) {
         2 => { Cpu::fetch(nes); },
         3 => { nes.read(0x100 + nes.cpu.sp.0 as u16); }
         4 => {
-            nes.cpu.status.bits = Cpu::stack_pull(nes) & 0b11001111; //TODO: Verify bits [5:4] are supposed to be ignored by PLP
-            nes.cpu.status.bits |= 0b00100000; // Apparently, bit 5 should always be set
+            nes.cpu.status.0 = Cpu::stack_pull(nes) & 0b11001111; //TODO: Verify bits [5:4] are supposed to be ignored by PLP
+            nes.cpu.status.0 |= 0b00100000; // Apparently, bit 5 should always be set
         },
         5 => nes.cpu.proc.tmp0 = Cpu::stack_pull(nes),
         6 => {
@@ -1239,13 +1237,14 @@ fn sbc(nes: &mut Nes) {
     if let Some(addr) = effective_addr(nes) {
         let data = !nes.read(addr);
         
-        let result = (nes.cpu.acc as u16).wrapping_add(data as u16).wrapping_add(nes.cpu.status.contains(StatusReg::Carry) as u16);
+        let result = nes.cpu.acc as u16 + data as u16 + nes.cpu.status.carry() as u16;
+        let (result, carry) = (result as u8, result & 0x100 != 0);
         
-        nes.cpu.status.set(StatusReg::Carry, result & 0x100 != 0);
-        nes.cpu.status.set(StatusReg::Overflow, (!(nes.cpu.acc ^ data) & (nes.cpu.acc ^ result as u8) & 0x80) != 0);
-        nes.cpu.status.set(StatusReg::Zero, (result as u8) == 0);
-        nes.cpu.status.set(StatusReg::Negative, result & 0x80 > 0);
-        nes.cpu.acc = result as u8;
+        nes.cpu.status.set_carry(carry);
+        nes.cpu.status.set_overflow((!(nes.cpu.acc ^ data) & (nes.cpu.acc ^ result as u8) & 0x80) != 0);
+        nes.cpu.status.set_zero(result == 0);
+        nes.cpu.status.set_negative(result & 0x80 != 0);
+        nes.cpu.acc = result;
         
         nes.cpu.proc.done = true;
     }
@@ -1254,7 +1253,7 @@ fn sbx(nes: &mut Nes) { unimplemented!() }
 fn sec(nes: &mut Nes) {
     match nes.cpu.proc.cycle {
         2 => {
-            nes.cpu.status.set(StatusReg::Carry, true);
+            nes.cpu.status.set_carry(true);
             
             nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
@@ -1265,7 +1264,7 @@ fn sec(nes: &mut Nes) {
 fn sed(nes: &mut Nes) {
     match nes.cpu.proc.cycle {
         2 => {
-            nes.cpu.status.set(StatusReg::Decimal, true);
+            nes.cpu.status.set_decimal(true);
             
             nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
@@ -1276,7 +1275,7 @@ fn sed(nes: &mut Nes) {
 fn sei(nes: &mut Nes) {
     match nes.cpu.proc.cycle {
         2 => {
-            nes.cpu.status.set(StatusReg::InterruptDisable, true);
+            nes.cpu.status.set_interrupt_disable(true);
             
             nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
@@ -1290,13 +1289,13 @@ fn shx(nes: &mut Nes) { unimplemented!() } // Reminder: consume extra cycle writ
 fn shy(nes: &mut Nes) { unimplemented!() } // Reminder: consume extra cycle write-instruction using AbsoluteX or AbsoluteY
 fn slo(nes: &mut Nes) {
     if let Some(addr) = read_modify_write(nes) {
-        nes.cpu.status.set(StatusReg::Carry, nes.cpu.proc.tmp0 & 0x80 != 0);
+        nes.cpu.status.set_carry(nes.cpu.proc.tmp0 & 0x80 != 0);
         nes.cpu.proc.tmp0 <<= 1;
         
         nes.cpu.acc |= nes.cpu.proc.tmp0;
         
-        nes.cpu.status.set(StatusReg::Zero, nes.cpu.acc == 0);
-        nes.cpu.status.set(StatusReg::Negative, nes.cpu.acc & 0x80 > 0);
+        nes.cpu.status.set_zero(nes.cpu.acc == 0);
+        nes.cpu.status.set_negative(nes.cpu.acc & 0x80 != 0);
         nes.write(addr, nes.cpu.proc.tmp0);
         
         nes.cpu.proc.done = true;
@@ -1304,13 +1303,13 @@ fn slo(nes: &mut Nes) {
 }
 fn sre(nes: &mut Nes) {
     if let Some(addr) = read_modify_write(nes) {
-        nes.cpu.status.set(StatusReg::Carry, nes.cpu.proc.tmp0 & 0x01 != 0);
+        nes.cpu.status.set_carry(nes.cpu.proc.tmp0 & 0x01 != 0);
         nes.cpu.proc.tmp0 >>= 1;
         
         nes.cpu.acc ^= nes.cpu.proc.tmp0;
         
-        nes.cpu.status.set(StatusReg::Zero, nes.cpu.acc == 0);
-        nes.cpu.status.set(StatusReg::Negative, nes.cpu.acc & 0x80 > 0);
+        nes.cpu.status.set_zero(nes.cpu.acc == 0);
+        nes.cpu.status.set_negative(nes.cpu.acc & 0x80 != 0);
         nes.write(addr, nes.cpu.proc.tmp0);
         
         nes.cpu.proc.done = true;
@@ -1352,8 +1351,8 @@ fn tax(nes: &mut Nes) {
         2 => {
             nes.cpu.x = nes.cpu.acc;
             
-            nes.cpu.status.set(StatusReg::Zero, nes.cpu.x == 0);
-            nes.cpu.status.set(StatusReg::Negative, nes.cpu.x & 0x80 > 0);
+            nes.cpu.status.set_zero(nes.cpu.x == 0);
+            nes.cpu.status.set_negative(nes.cpu.x & 0x80 != 0);
             
             nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
@@ -1366,8 +1365,8 @@ fn tay(nes: &mut Nes) {
         2 => {
             nes.cpu.y = nes.cpu.acc;
             
-            nes.cpu.status.set(StatusReg::Zero, nes.cpu.y == 0);
-            nes.cpu.status.set(StatusReg::Negative, nes.cpu.y & 0x80 > 0);
+            nes.cpu.status.set_zero(nes.cpu.y == 0);
+            nes.cpu.status.set_negative(nes.cpu.y & 0x80 != 0);
             
             nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
@@ -1380,8 +1379,8 @@ fn tsx(nes: &mut Nes) {
         2 => {
             nes.cpu.x = nes.cpu.sp.0;
             
-            nes.cpu.status.set(StatusReg::Zero, nes.cpu.x == 0);
-            nes.cpu.status.set(StatusReg::Negative, nes.cpu.x & 0x80 > 0);
+            nes.cpu.status.set_zero(nes.cpu.x == 0);
+            nes.cpu.status.set_negative(nes.cpu.x & 0x80 != 0);
             
             nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
@@ -1394,8 +1393,8 @@ fn txa(nes: &mut Nes) {
         2 => {
             nes.cpu.acc = nes.cpu.x;
             
-            nes.cpu.status.set(StatusReg::Zero, nes.cpu.acc == 0);
-            nes.cpu.status.set(StatusReg::Negative, nes.cpu.acc & 0x80 > 0);
+            nes.cpu.status.set_zero(nes.cpu.acc == 0);
+            nes.cpu.status.set_negative(nes.cpu.acc & 0x80 != 0);
             
             nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
@@ -1419,8 +1418,8 @@ fn tya(nes: &mut Nes) {
         2 => {
             nes.cpu.acc = nes.cpu.y;
             
-            nes.cpu.status.set(StatusReg::Zero, nes.cpu.acc == 0);
-            nes.cpu.status.set(StatusReg::Negative, nes.cpu.acc & 0x80 > 0);
+            nes.cpu.status.set_zero(nes.cpu.acc == 0);
+            nes.cpu.status.set_negative(nes.cpu.acc & 0x80 != 0);
             
             nes.read(nes.cpu.pc);
             nes.cpu.proc.done = true;
