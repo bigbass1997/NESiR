@@ -391,7 +391,7 @@ mod tests {
         nes.cpu.pc = 0xC000;
         nes.cpu.predecode = nes.read(nes.cpu.pc);
         nes.cpu.cyc = 7;
-        nes.ppu.pos = crate::arch::ppu::PixelPos { cycle: 19, scanline: 0 };
+        nes.ppu.pos = crate::arch::ppu::PixelPos { cycle: 19, scanline: 0, ..Default::default() };
         nes.cpu.status.0 = 0x24;
         
         loop {
@@ -503,7 +503,7 @@ mod cputests {
     #[test]
     #[cfg(feature = "tomharte")]
     fn tomharte() -> Result<(), Box<dyn Error>> {
-        tracing_subscriber::fmt().with_env_filter("info,nesir=info").init();
+        tracing_subscriber::fmt().with_env_filter("info,nesir=debug").init();
         let mut handles = Vec::with_capacity(256);
         for entry in walkdir::WalkDir::new("tomharte")
             .sort_by_file_name()
@@ -523,8 +523,9 @@ mod cputests {
             }){
             
             // TODO: Change to build.rs script to generate individual tests, letting cargo parallelize this automatically
-            handles.push(std::thread::spawn(|| {
-                let tests: Vec<TestData> = simd_json::from_reader(File::open(entry.into_path()).unwrap()).unwrap();
+            handles.push(std::thread::spawn(move || {
+                let file_name = entry.file_name().to_string_lossy();
+                let tests: Vec<TestData> = simd_json::from_reader(File::open(entry.path()).unwrap()).unwrap();
                 let total = tests.len();
                 for (i, test) in tests.into_iter().enumerate() {
                     trace!("testing: {} ({})", test.name, test.cycles.len());
@@ -561,10 +562,10 @@ mod cputests {
                         assert!(nes.cpu.proc.cycle < 10, "cycle runaway! instruction may be stuck in a loop");
                     }
                     
-                    assert!(test.final_ == nes.cpu, " left: {:X?}\nright: {:X?}", test.final_, State::from(&nes.cpu));
+                    assert!(test.final_ == nes.cpu, "{}:\n\t left: {:X?}\n\tright: {:X?}", test.name, test.final_, State::from(&nes.cpu));
                     
-                    if i % 100 == 0 {
-                        tracing::debug!("completed: {i}/{total}");
+                    if (i + 1) % 1000 == 0 {
+                        tracing::debug!("{file_name} progress: {i}/{total}");
                     }
                 }
             }));

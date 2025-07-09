@@ -525,7 +525,7 @@ fn adc(nes: &mut Nes) {
         let (result, carry) = (result as u8, result & 0x100 != 0);
         
         nes.cpu.status.set_carry(carry);
-        nes.cpu.status.set_overflow((!(nes.cpu.acc ^ data) & (nes.cpu.acc ^ result as u8) & 0x80) != 0);
+        nes.cpu.status.set_overflow((!(nes.cpu.acc ^ data) & (nes.cpu.acc ^ result) & 0x80) != 0);
         nes.cpu.status.set_zero(result == 0);
         nes.cpu.status.set_negative(result & 0x80 != 0);
         nes.cpu.acc = result;
@@ -565,11 +565,11 @@ fn asl(nes: &mut Nes) {
         },
         _ => {
             if let Some(addr) = read_modify_write(nes) {
-                nes.cpu.status.set_carry(nes.cpu.acc & 0x80 != 0);
+                nes.cpu.status.set_carry(nes.cpu.proc.tmp0 & 0x80 != 0);
                 nes.cpu.proc.tmp0 <<= 1;
                 
-                nes.cpu.status.set_zero(nes.cpu.acc == 0);
-                nes.cpu.status.set_negative(nes.cpu.acc & 0x80 != 0);
+                nes.cpu.status.set_zero(nes.cpu.proc.tmp0 == 0);
+                nes.cpu.status.set_negative(nes.cpu.proc.tmp0 & 0x80 != 0);
                 nes.write(addr, nes.cpu.proc.tmp0);
                 
                 nes.cpu.proc.done = true;
@@ -730,9 +730,9 @@ fn cpx(nes: &mut Nes) {
     if let Some(addr) = effective_addr(nes) {
         let data = nes.read(addr);
         
-        nes.cpu.status.set_carry(nes.cpu.acc >= data);
-        nes.cpu.status.set_zero(nes.cpu.acc == data);
-        nes.cpu.status.set_negative(nes.cpu.acc.wrapping_sub(data) & 0x80 != 0);
+        nes.cpu.status.set_carry(nes.cpu.x >= data);
+        nes.cpu.status.set_zero(nes.cpu.x == data);
+        nes.cpu.status.set_negative(nes.cpu.x.wrapping_sub(data) & 0x80 != 0);
         
         nes.cpu.proc.done = true;
     }
@@ -741,9 +741,9 @@ fn cpy(nes: &mut Nes) {
     if let Some(addr) = effective_addr(nes) {
         let data = nes.read(addr);
         
-        nes.cpu.status.set_carry(nes.cpu.acc >= data);
-        nes.cpu.status.set_zero(nes.cpu.acc == data);
-        nes.cpu.status.set_negative(nes.cpu.acc.wrapping_sub(data) & 0x80 != 0);
+        nes.cpu.status.set_carry(nes.cpu.y >= data);
+        nes.cpu.status.set_zero(nes.cpu.y == data);
+        nes.cpu.status.set_negative(nes.cpu.y.wrapping_sub(data) & 0x80 != 0);
         
         nes.cpu.proc.done = true;
     }
@@ -1147,11 +1147,11 @@ fn rol(nes: &mut Nes) {
         _ => {
             if let Some(addr) = read_modify_write(nes) {
                 let c = nes.cpu.status.carry() as u8;
-                nes.cpu.status.set_carry(nes.cpu.acc & 0x80 != 0);
+                nes.cpu.status.set_carry(nes.cpu.proc.tmp0 & 0x80 != 0);
                 nes.cpu.proc.tmp0 = ((nes.cpu.proc.tmp0 << 1) & 0xFE) | c;
                 
-                nes.cpu.status.set_zero(nes.cpu.acc == 0);
-                nes.cpu.status.set_negative(nes.cpu.acc & 0x80 != 0);
+                nes.cpu.status.set_zero(nes.cpu.proc.tmp0 == 0);
+                nes.cpu.status.set_negative(nes.cpu.proc.tmp0 & 0x80 != 0);
                 nes.write(addr, nes.cpu.proc.tmp0);
                 
                 nes.cpu.proc.done = true;
