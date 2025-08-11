@@ -51,7 +51,7 @@ impl Nes {
     }
 }
 
-#[cfg(not(feature = "tomharte"))]
+#[cfg(not(feature = "sst"))]
 impl CpuBusAccessible for Nes {
     fn write(&mut self, addr: u16, data: u8) {
         self.cpu.predecode = data;
@@ -97,7 +97,7 @@ impl CpuBusAccessible for Nes {
     }
 }
 
-#[cfg(feature = "tomharte")]
+#[cfg(feature = "sst")]
 impl CpuBusAccessible for Nes {
     fn write(&mut self, addr: u16, data: u8) {
         self.cpu.predecode = data;

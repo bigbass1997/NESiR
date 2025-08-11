@@ -1,13 +1,14 @@
 #![allow(unused_variables)]
 #![allow(non_upper_case_globals)]
 
+#[cfg(all(test, feature = "sst"))]
+use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 use std::num::Wrapping;
 use proc_bitfield::bitfield;
 use tracing::trace;
 use crate::arch::{Nes, CpuBusAccessible, ClockDivider};
 use AddrMode::*;
-use crate::TestState;
 
 
 bitfield! {
@@ -16,6 +17,7 @@ bitfield! {
         pub negative: bool @ 7,
         pub overflow: bool @ 6,
         
+        #[allow(non_snake_case)]
         pub _break: bool @ 4,
         pub decimal: bool @ 3,
         pub interrupt_disable: bool @ 2,
@@ -107,9 +109,9 @@ impl InstructionProcedure {
 
 #[derive(Clone, Debug)]
 pub struct Cpu {
-    #[cfg(feature = "tomharte")]
-    pub wram: [u8; 0x10000],
-    #[cfg(not(feature = "tomharte"))]
+    #[cfg(all(test, feature = "sst"))]
+    pub wram: HashMap<u16, u8>,
+    #[cfg(not(feature = "sst"))]
     pub wram: [u8; 0x800],
     pub pc: u16,
     pub sp: Wrapping<u8>,
@@ -126,7 +128,8 @@ pub struct Cpu {
     pub(crate) proc: InstructionProcedure,
     pub clock_divider: ClockDivider<12>,
     pub cyc: usize,
-    pub last_state: Option<TestState>,
+    #[cfg(all(test, not(feature = "sst")))]
+    pub last_state: Option<crate::tests::TestState>,
     pub dma_upper: u8,
 }
 impl Default for Cpu {
@@ -135,9 +138,9 @@ impl Default for Cpu {
         proc.done = true;
         
         Self {
-            #[cfg(feature = "tomharte")]
-            wram: [0u8; 0x10000],
-            #[cfg(not(feature = "tomharte"))]
+            #[cfg(all(test, feature = "sst"))]
+            wram: HashMap::new(),
+            #[cfg(not(feature = "sst"))]
             wram: [0u8; 0x800],
             pc: 0,
             sp: Wrapping(0xFD), // actually this is potentialy random at power-on // software typically initializes this to 0xFF
@@ -151,6 +154,7 @@ impl Default for Cpu {
             proc,
             clock_divider: ClockDivider::new(0), //todo: randomize
             cyc: 0,
+            #[cfg(all(test, not(feature = "sst")))]
             last_state: None,
             dma_upper: 0,
         }
@@ -452,9 +456,9 @@ impl Cpu {
                 _ => panic!("Attempt to run invalid/unimplemented opcode! PC: {:#06X}, Op: {:#06X}", nes.cpu.pc, nes.cpu.predecode)
             };
             
-            #[cfg(test)]
+            #[cfg(all(test, not(feature = "sst")))]
             {
-                nes.cpu.last_state = Some(TestState::from_nes(nes.clone()));
+                nes.cpu.last_state = Some(crate::tests::TestState::from_nes(nes.clone()));
             }
             trace!("PC: {:04X}, Op: {:02X}, Status: {}, ACC: {:02X}, X: {:02X}, Y: {:02X}, SP: {:02X}, PPU: {}, CYC: {}", nes.cpu.pc - 1, nes.cpu.predecode, nes.cpu.status, nes.cpu.acc, nes.cpu.x, nes.cpu.y, nes.cpu.sp, nes.ppu.pos, nes.cpu.cyc);
             
@@ -483,7 +487,7 @@ impl Cpu {
         nes.read(0x100 + nes.cpu.sp.0 as u16)
     }
 }
-#[cfg(not(feature = "tomharte"))]
+#[cfg(not(feature = "sst"))]
 impl CpuBusAccessible for Cpu {
     fn write(&mut self, addr: u16, data: u8) {
         match addr {
@@ -504,14 +508,14 @@ impl CpuBusAccessible for Cpu {
     }
 }
 
-#[cfg(feature = "tomharte")]
+#[cfg(feature = "sst")]
 impl CpuBusAccessible for Cpu {
     fn write(&mut self, addr: u16, data: u8) {
-        self.wram[addr as usize] = data;
+        self.wram.insert(addr, data);
     }
 
     fn read(&mut self, addr: u16) -> u8 {
-        self.wram[addr as usize]
+        *self.wram.get(&addr).unwrap_or(&0)
     }
 }
 

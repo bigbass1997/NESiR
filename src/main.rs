@@ -1,11 +1,10 @@
 use std::path::PathBuf;
 use std::str::FromStr;
-use std::time::Duration;
 use clap::Parser;
 use minifb::{Key, Scale, ScaleMode, Window, WindowOptions};
 use tracing_subscriber::filter::LevelFilter;
 use crate::arch::mappers::RomFile;
-use crate::arch::{CpuBusAccessible, Nes};
+use crate::arch::Nes;
 
 pub mod arch;
 
@@ -96,7 +95,7 @@ fn main() {
             none: false,
         },
     ).expect("failed to initialize window");
-    window.limit_update_rate(Some(Duration::from_micros(16666)));
+    window.set_target_fps(60);
     
     let mut pattern_window = Window::new(
         "NESiR - Pattern Table",
@@ -113,7 +112,7 @@ fn main() {
             none: false,
         },
     ).expect("failed to initialize window");
-    pattern_window.limit_update_rate(None);
+    pattern_window.set_target_fps(0);
     pattern_window.set_position(2624 + 520, 200);
     let mut pattern_fb = [0x00555555u32; 256 * 128];
     
@@ -132,7 +131,7 @@ fn main() {
             none: false,
         },
     ).expect("failed to initialize window");
-    nametable_window.limit_update_rate(None);
+    nametable_window.set_target_fps(0);
     nametable_window.set_position(2624 + 520, 500);
     let mut nametable_fb = [0x00555555u32; 64 * 32];
     
@@ -151,7 +150,7 @@ fn main() {
             none: false,
         },
     ).expect("failed to initialize window");
-    palette_window.limit_update_rate(None);
+    palette_window.set_target_fps(0);
     palette_window.set_position(2624 + 520, 800);
     let mut palette_fb = [0x00555555u32; 4 * 8];
     
@@ -271,39 +270,39 @@ fn render_pattern_table(nes: &mut Nes, fb: &mut [u32; 256 * 128]) {
 
 
 
-#[derive(Debug, Default, Copy, Clone)]
-pub struct TestState {
-    pub pc: u16,
-    pub opcode: u8,
-    pub sp: u8,
-    pub status: u8,
-    pub acc: u8,
-    pub x: u8,
-    pub y: u8,
-    pub cyc: usize,
-}
-impl TestState {
-    pub fn from_nes(mut nes: Nes) -> Self {
-        Self {
-            pc: nes.cpu.pc - 1,
-            opcode: nes.read(nes.cpu.pc - 1),
-            sp: nes.cpu.sp.0,
-            status: nes.cpu.status.0,
-            acc: nes.cpu.acc,
-            x: nes.cpu.x,
-            y: nes.cpu.y,
-            cyc: nes.cpu.cyc,
-        }
-    }
-}
 
-#[cfg(test)]
-#[cfg(not(feature = "tomharte"))]
+#[cfg(all(test, not(feature = "sst")))]
 mod tests {
-    use crate::arch::cpu::{Cpu, StatusReg};
+    use crate::arch::cpu::Cpu;
     use crate::arch::mappers::RomFile;
     use crate::arch::{CpuBusAccessible, Nes};
-    use crate::TestState;
+    
+    
+    #[derive(Debug, Default, Copy, Clone)]
+    pub struct TestState {
+        pub pc: u16,
+        pub opcode: u8,
+        pub sp: u8,
+        pub status: u8,
+        pub acc: u8,
+        pub x: u8,
+        pub y: u8,
+        pub cyc: usize,
+    }
+    impl TestState {
+        pub fn from_nes(mut nes: Nes) -> Self {
+            Self {
+                pc: nes.cpu.pc - 1,
+                opcode: nes.read(nes.cpu.pc - 1),
+                sp: nes.cpu.sp.0,
+                status: nes.cpu.status.0,
+                acc: nes.cpu.acc,
+                x: nes.cpu.x,
+                y: nes.cpu.y,
+                cyc: nes.cpu.cyc,
+            }
+        }
+    }
 
     #[derive(Debug, Eq, PartialEq)]
     pub enum TestError {
@@ -373,12 +372,6 @@ mod tests {
     
     #[test]
     fn nestest() {
-        /*{
-            let mut logbuilder = logger::builder();
-            logbuilder.filter_level(LevelFilter::Trace);
-            logbuilder.init();
-        }*/
-        
         let rom = RomFile::new(include_bytes!("../testroms/nestest.nes"));
         
         let log = include_str!("../testroms/nestest.log");
@@ -416,16 +409,25 @@ mod tests {
     }
 }
 
-#[cfg(test)]
-#[cfg(feature = "tomharte")]
+#[cfg(all(test, feature = "sst"))]
 mod cputests {
+    use std::collections::HashMap;
     use std::error::Error;
     use std::fs::File;
     use std::num::Wrapping;
     use tracing::trace;
-    use serde::{Deserialize, Serialize};
+    use serde::{Deserialize, Deserializer, Serialize};
     use crate::arch::cpu::Cpu;
     use crate::arch::Nes;
+    
+    fn deserialize_test_ram<'de, D: Deserializer<'de>>(deserializer: D) -> Result<HashMap<u16, u8>, D::Error> {
+        let ram: Vec<(u16, u8)> = Vec::deserialize(deserializer)?;
+        
+        let mut map = HashMap::with_capacity(ram.len());
+        map.extend(ram);
+        
+        Ok(map)
+    }
     
     #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
     struct State {
@@ -435,17 +437,11 @@ mod cputests {
         x: u8,
         y: u8,
         p: u8,
-        ram: Vec<(u16, u8)>,
+        #[serde(deserialize_with = "deserialize_test_ram")]
+        ram: HashMap<u16, u8>,
     }
     impl From<&Cpu> for State {
         fn from(cpu: &Cpu) -> Self {
-            let mut ram = Vec::with_capacity(8);
-            for (addr, data) in cpu.wram.into_iter().enumerate() {
-                if data != 0 {
-                    ram.push((addr as u16, data));
-                }
-            }
-            
             Self {
                 pc: cpu.pc,
                 s: cpu.sp.0,
@@ -453,23 +449,23 @@ mod cputests {
                 x: cpu.x,
                 y: cpu.y,
                 p: cpu.status.0,
-                ram,
+                ram: cpu.wram.clone(),
             }
         }
     }
     impl PartialEq<Cpu> for State {
-        fn eq(&self, other: &Cpu) -> bool {
-            if self.pc != other.pc { return false; }
-            if self.s != other.sp.0 { return false; }
-            if self.a != other.acc { return false; }
-            if self.x != other.x { return false; }
-            if self.y != other.y { return false; }
-            if self.p != other.status.0 { return false; }
+        fn eq(&self, cpu: &Cpu) -> bool {
+            if self.pc != cpu.pc { return false; }
+            if self.s != cpu.sp.0 { return false; }
+            if self.a != cpu.acc { return false; }
+            if self.x != cpu.x { return false; }
+            if self.y != cpu.y { return false; }
+            if self.p != cpu.status.0 { return false; }
             
-            for (addr, data) in other.wram.into_iter().enumerate() {
-                match self.ram.iter().find(|(s_addr, _)| *s_addr as usize == addr) {
-                    Some((_, s_data)) if *s_data != data => { return false; },
-                    None if data != 0 => { return false; },
+            for (addr, data) in cpu.wram.iter() {
+                match self.ram.get(addr) {
+                    Some(s_data) if s_data != data => { return false; },
+                    None if *data != 0 => { return false; },
                     _ => ()
                 }
             }
@@ -501,11 +497,11 @@ mod cputests {
     }
     
     #[test]
-    #[cfg(feature = "tomharte")]
-    fn tomharte() -> Result<(), Box<dyn Error>> {
-        tracing_subscriber::fmt().with_env_filter("info,nesir=debug").init();
-        let mut handles = Vec::with_capacity(256);
-        for entry in walkdir::WalkDir::new("tomharte")
+    #[cfg(feature = "sst")]
+    fn sst() -> Result<(), Box<dyn Error>> {
+        tracing_subscriber::fmt().with_env_filter("info,nesir=info").init();
+        
+        let file_iterator = walkdir::WalkDir::new("sst")
             .sort_by_file_name()
             .into_iter()
             .filter_map(|e| e.ok())
@@ -520,26 +516,30 @@ mod cputests {
                     0x93, 0x9B, 0x9C, 0x9E, 0x9F, // SHA, SHS, SHY, SHX (illegals)
                     0xAB, 0xCB, // LXA, SBX (illegals)
                 ].contains(&opcode)
-            }){
-            
-            // TODO: Change to build.rs script to generate individual tests, letting cargo parallelize this automatically
-            handles.push(std::thread::spawn(move || {
-                let file_name = entry.file_name().to_string_lossy();
-                let tests: Vec<TestData> = simd_json::from_reader(File::open(entry.path()).unwrap()).unwrap();
-                let total = tests.len();
-                for (i, test) in tests.into_iter().enumerate() {
+            })
+            .map(|e| {
+                let file_name = e.file_name().to_string_lossy().to_string();
+                let tests: Vec<TestData> = simd_json::from_reader(File::open(e.path()).unwrap()).unwrap();
+                
+                (file_name, tests)
+            });
+        
+        //let mut handles = Vec::with_capacity(256);
+        for (file_name, tests) in file_iterator {
+            // TODO: Change to build.rs script to generate a test for each JSON file, letting cargo parallelize this automatically
+            //handles.push(std::thread::spawn(move || {
+                let mut nes = Nes::new();
+                for test in tests {
                     trace!("testing: {} ({})", test.name, test.cycles.len());
-                    let mut nes = Nes::new();
                     
+                    nes.cpu = Cpu::default();
                     nes.cpu.pc = test.initial.pc;
                     nes.cpu.sp = Wrapping(test.initial.s);
                     nes.cpu.acc = test.initial.a;
                     nes.cpu.x = test.initial.x;
                     nes.cpu.y = test.initial.y;
                     nes.cpu.status.0 = test.initial.p;
-                    for (addr, data) in &test.initial.ram {
-                        nes.cpu.wram[*addr as usize] = *data;
-                    }
+                    nes.cpu.wram = test.initial.ram.clone();
                     assert!(test.initial == nes.cpu, " left: {:X?}\nright: {:X?}", test.initial, State::from(&nes.cpu));
                     trace!("init: {:X?}", State::from(&nes.cpu));
                     
@@ -563,17 +563,14 @@ mod cputests {
                     }
                     
                     assert!(test.final_ == nes.cpu, "{}:\n\t left: {:X?}\n\tright: {:X?}", test.name, test.final_, State::from(&nes.cpu));
-                    
-                    if (i + 1) % 1000 == 0 {
-                        tracing::debug!("{file_name} progress: {i}/{total}");
-                    }
                 }
-            }));
+                tracing::debug!("{file_name} complete");
+            //}));
         }
         
-        for handle in handles {
-            handle.join().unwrap();
-        }
+        //for handle in handles {
+        //    handle.join().unwrap();
+        //}
         
         Ok(())
     }
