@@ -8,11 +8,6 @@ pub mod cpu;
 pub mod mappers;
 pub mod ppu;
 
-pub trait CpuBusAccessible {
-    fn write(&mut self, addr: u16, data: u8);
-    fn read(&mut self, addr: u16) -> u8;
-}
-
 /// Collection of major components found within the NES.
 /// 
 /// To simplify the access of data from different system components, this struct holds all the major
@@ -22,17 +17,13 @@ pub trait CpuBusAccessible {
 /// For example, the real PPU only has access to the cartridge's CHR RAM/ROM. But to split the
 /// cartridge into separate data structures would increase code complexity for little advantage. So
 /// here it is represented as a single entity.
-/// 
-/// The [`Nes`] and all components in it, implement the [`CpuBusAccessible`] trait. Methods exposed
-/// by this trait, are accessed with respect to the CPU's memory map. The PPU's own memory map is
-/// NOT directly accessible through implementations of this trait.
 #[derive(Debug, Default, Clone)]
 pub struct Nes {
     pub cpu: Cpu,
     pub ppu: Ppu,
     pub cart: Cartridge,
     
-    pub last_bus: (u16, u8, bool), // addr, data, is_read
+    pub last_bus: BusActivity,
 }
 impl Nes {
     pub fn new() -> Self {
@@ -49,74 +40,73 @@ impl Nes {
         self.cart.mapper = rom.into_mapper();
         Cpu::init_pc(self);
     }
-}
-
-#[cfg(not(feature = "sst"))]
-impl CpuBusAccessible for Nes {
-    fn write(&mut self, addr: u16, data: u8) {
+    
+    /// Write to the CPU's external bus.
+    /// 
+    /// This bus is connected to the 2A03 CPU (including the APU and other internal components), PPU, and the cartridge.
+    #[cfg(not(feature = "sst"))]
+    pub fn write(&mut self, addr: u16, data: u8) {
         self.cpu.predecode = data;
         
-        if addr == 0x0647 {
-            //trace!("### Wrote {:#04X} to {:#06X}", data, addr);
-        } else {
-            //trace!("    Wrote {:#04X} to {:#06X}", data, addr);
-        }
         match addr {
-            0x0000..=0x1FFF | 0x4014 => self.cpu.write(addr, data),
+            0x0000..=0x1FFF | 0x4014 => self.cpu.internal_write(addr, data),
             0x2000..=0x3FFF => Ppu::port_write(self, addr, data),
             0x4000..=0x4017 => (),
             0x4018..=0x401F => panic!("Write attempt to CPU Test Mode at address {:#06X} ({:#04X})", addr, data),
             0x4020..=0xFFFF => self.cart.write_cpu(addr, data),
-            //_ => panic!("Write attempt to invalid address {:#06X} ({:#04X})", addr, data),
         }
         
-        self.last_bus = (addr, data, false);
+        self.last_bus = BusActivity { addr, data, is_read: false };
     }
-
-    fn read(&mut self, addr: u16) -> u8 {
-        let val = match addr {
-            0x0000..=0x1FFF => self.cpu.read(addr),
+    
+    /// Read from the CPU's external bus.
+    /// 
+    /// This bus is connected to the 2A03 CPU (including the APU and other internal components), PPU, and the cartridge.
+    #[cfg(not(feature = "sst"))]
+    pub fn read(&mut self, addr: u16) -> u8 {
+        let data = match addr {
+            0x0000..=0x1FFF => self.cpu.internal_read(addr),
             0x2000..=0x3FFF => Ppu::port_read(self, addr),
             0x4000..=0x4017 => 0,
             0x4018..=0x401F => panic!("Read attempt to CPU Test Mode at address {:#06X}", addr),
             0x4020..=0xFFFF => self.cart.read_cpu(addr),
-            //_ => panic!("Read attempt to invalid address {:#06X}", addr),
         };
         
-        if addr == 0x0647 {
-            //trace!("### Read {:#04X} from {:#06X}", val, addr);
-        } else {
-            //trace!("    Read {:#04X} from {:#06X}", val, addr);
-        }
-        
-        self.cpu.predecode = val;
-        
-        self.last_bus = (addr, val, true);
-        
-        val
-    }
-}
-
-#[cfg(feature = "sst")]
-impl CpuBusAccessible for Nes {
-    fn write(&mut self, addr: u16, data: u8) {
         self.cpu.predecode = data;
         
-        self.cpu.write(addr, data);
+        self.last_bus = BusActivity { addr, data, is_read: true };
         
-        self.last_bus = (addr, data, false);
+        data
     }
-
-    fn read(&mut self, addr: u16) -> u8 {
-        let val = self.cpu.read(addr);
+    
+    #[cfg(feature = "sst")]
+    pub fn write(&mut self, addr: u16, data: u8) {
+        self.cpu.predecode = data;
         
-        self.cpu.predecode = val;
+        self.cpu.internal_write(addr, data);
         
-        self.last_bus = (addr, val, true);
+        self.last_bus = BusActivity { addr, data, is_read: false };
+    }
+    
+    #[cfg(feature = "sst")]
+    pub fn read(&mut self, addr: u16) -> u8 {
+        let data = self.cpu.internal_read(addr);
         
-        val
+        self.cpu.predecode = data;
+        
+        self.last_bus = BusActivity { addr, data, is_read: true };
+        
+        data
     }
 }
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct BusActivity {
+    pub addr: u16,
+    pub data: u8,
+    pub is_read: bool,
+}
+
 
 #[derive(Clone, Debug)]
 pub struct ClockDivider<const N: usize> {

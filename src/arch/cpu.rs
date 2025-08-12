@@ -7,7 +7,7 @@ use std::fmt::{Debug, Formatter};
 use std::num::Wrapping;
 use proc_bitfield::bitfield;
 use tracing::trace;
-use crate::arch::{Nes, CpuBusAccessible, ClockDivider};
+use crate::arch::{Nes, ClockDivider};
 use AddrMode::*;
 
 
@@ -176,23 +176,19 @@ impl Cpu {
     }
     
     pub fn cycle(nes: &mut Nes) {
-        if !nes.cpu.rdy && nes.last_bus.2 {
-            nes.read(nes.last_bus.0);
+        if !nes.cpu.rdy && nes.last_bus.is_read {
+            nes.read(nes.last_bus.addr);
             
             nes.cpu.rdy = true; //DEBUG ONLY
             return;
         }
         
-        //#[cfg(feature = "tomharte")]
-        //println!("PC: {:04X}, Op: {:02X}, Status: {}, ACC: {:02X}, X: {:02X}, Y: {:02X}, SP: {:02X}, PPU: {}, CYC: {}", nes.cpu.pc - 1, nes.cpu.predecode, nes.cpu.status, nes.cpu.acc, nes.cpu.x, nes.cpu.y, nes.cpu.sp, nes.ppu.pos, nes.cpu.cyc);
-        
         if nes.cpu.proc.done && !nes.cpu.nmi {
             nes.cpu.proc = InstructionProcedure::new(nmi, AddrMode::Implied);
             nes.cpu.nmi = true; // disable NMI trigger signal (NMI is active-low)
         } else if nes.cpu.proc.done {
-            Cpu::fetch(nes);
             
-            nes.cpu.proc = match nes.cpu.predecode {
+            nes.cpu.proc = match Cpu::fetch(nes) {
                 0x00 => InstructionProcedure::new(brk, Auto),
                 0x01 => InstructionProcedure::new(ora, IndirectX),
                 0x03 => InstructionProcedure::new(slo, IndirectX),
@@ -456,13 +452,14 @@ impl Cpu {
                 _ => panic!("Attempt to run invalid/unimplemented opcode! PC: {:#06X}, Op: {:#06X}", nes.cpu.pc, nes.cpu.predecode)
             };
             
+            nes.cpu.proc.cycle = 2; // the decode above costs 1 cycle
+            
+            trace!("PC: {:04X}, Op: {:02X}, Status: {}, ACC: {:02X}, X: {:02X}, Y: {:02X}, SP: {:02X}, PPU: {}, CYC: {}", nes.cpu.pc - 1, nes.cpu.predecode, nes.cpu.status, nes.cpu.acc, nes.cpu.x, nes.cpu.y, nes.cpu.sp, nes.ppu.pos, nes.cpu.cyc);
+            
             #[cfg(all(test, not(feature = "sst")))]
             {
                 nes.cpu.last_state = Some(crate::tests::TestState::from_nes(nes.clone()));
             }
-            trace!("PC: {:04X}, Op: {:02X}, Status: {}, ACC: {:02X}, X: {:02X}, Y: {:02X}, SP: {:02X}, PPU: {}, CYC: {}", nes.cpu.pc - 1, nes.cpu.predecode, nes.cpu.status, nes.cpu.acc, nes.cpu.x, nes.cpu.y, nes.cpu.sp, nes.ppu.pos, nes.cpu.cyc);
-            
-            nes.cpu.proc.cycle = 2; // the decode above costs 1 cycle
         } else {
             InstructionProcedure::step(nes);
         }
@@ -486,10 +483,19 @@ impl Cpu {
         nes.cpu.sp += Wrapping(1);
         nes.read(0x100 + nes.cpu.sp.0 as u16)
     }
-}
-#[cfg(not(feature = "sst"))]
-impl CpuBusAccessible for Cpu {
-    fn write(&mut self, addr: u16, data: u8) {
+    
+    /// Read from the CPU's internal memory map
+    #[cfg(not(feature = "sst"))]
+    pub(super) fn internal_read(&mut self, addr: u16) -> u8 {
+        match addr {
+            0x0000..=0x1FFF => self.wram[(addr & 0x07FF) as usize],
+            _ => panic!("Read attempt to invalid address {:#06X}", addr),
+        }
+    }
+    
+    /// Write to the CPU's internal memory map
+    #[cfg(not(feature = "sst"))]
+    pub(super) fn internal_write(&mut self, addr: u16, data: u8) {
         match addr {
             0x0000..=0x1FFF => self.wram[(addr & 0x07FF) as usize] = data,
             0x4014 => {
@@ -499,25 +505,19 @@ impl CpuBusAccessible for Cpu {
             _ => panic!("Write attempt to invalid address {:#06X} ({:#04X})", addr, data),
         }
     }
-
-    fn read(&mut self, addr: u16) -> u8 {
-        match addr {
-            0x0000..=0x1FFF => self.wram[(addr & 0x07FF) as usize],
-            _ => panic!("Read attempt to invalid address {:#06X}", addr),
-        }
-    }
-}
-
-#[cfg(feature = "sst")]
-impl CpuBusAccessible for Cpu {
-    fn write(&mut self, addr: u16, data: u8) {
-        self.wram.insert(addr, data);
-    }
-
-    fn read(&mut self, addr: u16) -> u8 {
+    
+    /// Read from the CPU's internal memory map
+    #[cfg(feature = "sst")]
+    pub(super) fn internal_read(&mut self, addr: u16) -> u8 {
         *self.wram.get(&addr).unwrap_or(&0)
     }
+    /// Write to the CPU's internal memory map
+    #[cfg(feature = "sst")]
+    pub(super) fn internal_write(&mut self, addr: u16, data: u8) {
+        self.wram.insert(addr, data);
+    }
 }
+
 
 
 

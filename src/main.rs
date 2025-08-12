@@ -275,7 +275,7 @@ fn render_pattern_table(nes: &mut Nes, fb: &mut [u32; 256 * 128]) {
 mod tests {
     use crate::arch::cpu::Cpu;
     use crate::arch::mappers::RomFile;
-    use crate::arch::{CpuBusAccessible, Nes};
+    use crate::arch::Nes;
     
     
     #[derive(Debug, Default, Copy, Clone)]
@@ -418,7 +418,7 @@ mod cputests {
     use tracing::trace;
     use serde::{Deserialize, Deserializer, Serialize};
     use crate::arch::cpu::Cpu;
-    use crate::arch::Nes;
+    use crate::arch::{BusActivity, Nes};
     
     fn deserialize_test_ram<'de, D: Deserializer<'de>>(deserializer: D) -> Result<HashMap<u16, u8>, D::Error> {
         let ram: Vec<(u16, u8)> = Vec::deserialize(deserializer)?;
@@ -544,7 +544,7 @@ mod cputests {
                     trace!("init: {:X?}", State::from(&nes.cpu));
                     
                     fn test_cycle(cyc: usize, test: &TestData, nes: &Nes) {
-                        let (addr, data, is_read) = nes.last_bus;
+                        let BusActivity { addr, data, is_read } = nes.last_bus;
                         
                         trace!("({addr:04X}, {data:02X}, {:?})", if is_read { "read" } else { "write" });
                         assert!(test.cycles[cyc] == (addr, data, ReadWrite::from(is_read)), " left: {:X?}\nright: {:X?}", test.cycles[cyc], (addr, data, ReadWrite::from(is_read)));
